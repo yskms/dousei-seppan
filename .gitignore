@@ -1,0 +1,6 @@
+.DS_Store
+_local/
+docs/_local/
+.env
+.env.*
+node_modules/
