@@ -1,9 +1,9 @@
-# ふたりのおさいふ：バックエンド設計メモ
+# 同棲折半：バックエンド設計メモ
 
 - 更新日：2026-11-18
 - 状態：設計方針まとめ／実装前レビュー用
 - バックエンド候補：Cloudflare Workers + D1（SQLite）
-- 仕様の正本は企画メモ（[futari-no-osaifu-plan.md](futari-no-osaifu-plan.md)）。このメモは、それをD1とWorkerでどう実現するかをまとめる。食い違ったときは企画メモに合わせる
+- 仕様の正本は企画メモ（[plan.md](plan.md)）。このメモは、それをD1とWorkerでどう実現するかをまとめる。食い違ったときは企画メモに合わせる
 - 認証：Singfolioの既存実装（`singfolio/worker`）を流用する。Singfolioとアカウントを共通にするかは未決（企画メモ16章）。このメモでは、アプリごとに分ける前提で書く
 
 ---
@@ -108,6 +108,7 @@
 ### 保存する負担データ
 
 - `expenses.amount_minor`：支出総額
+- `category_month_settings`：月ごと・費目ごとの設定（上限額つきの負担の、負担する人と上限額）
 - `category_month_shares`：月ごと・費目ごと・メンバーごとの負担割合
 - `expense_allocations`：`category` 以外の支出の、メンバーごとの確定負担額（`burden_minor`）。割合指定のときは `share_basis_points` も残す
 
@@ -115,7 +116,8 @@
 
 ### 月ごとの負担割合
 
-- ある費目・ある月の割合は、`category_month_shares` のうち、その月以前で最も新しい月の行の組を使う（行が無い月は、直前の月の割合を引き継ぐ）。
+- ある費目・ある月の設定は、`category_month_settings` のうち、その月以前で最も新しい月の行と、同じ月の `category_month_shares` の行の組を使う（行が無い月は、直前の月の設定を引き継ぐ）。
+- `category_month_settings` の1行と `category_month_shares` の行の組は、常に同じ月でまとめて書く。どの月の設定を使うかは、`category_month_settings` の月で決まる。
 - 読み取り時には行をコピーしない。次のときに、その月の行の組を書く。
   - その月の割合を変更したとき
   - 費目を作ったとき（有効なメンバーで均等）
@@ -124,6 +126,18 @@
   - 月締め時（その月の行が無ければ、引き継いだ割合を書き、確定値として残す）
 - 1つの費目・月の行は、その月に負担対象となる全メンバーの組として書き、合計を10000にする。
 - 割合を変更できるのは、締めていない月だけ。
+- メンバーの増減で均等にリセットするときは、上限額の設定も外す（`cap_member_id`・`cap_minor` をNULLにする）。
+
+### 上限額つきの負担
+
+`category_month_settings` に `cap_member_id`（負担する人）と `cap_minor`（上限額）があるとき、その費目の `category` の支出の月合計 `T` を次のように分ける。
+
+1. 負担する人が `min(T, cap_minor)` を負担する。
+2. 超えた分 `T - cap_minor`（0より大きいとき）を、`category_month_shares` の割合で全員に分ける（端数処理は2章）。負担する人の割合は、上限額を設定したときの既定値を0にする（変更できる）。
+
+- 例：2人、外食の上限が自分の10,000円、超えた分の割合が自分0%・相手100%。`T` が8,000円なら、自分8,000円・相手0円。`T` が15,000円なら、自分10,000円・相手5,000円。
+- 上限額は費目の月合計に対してかける。支出ごとの個別設定（`category` 以外）の支出は、`T` に含めない。
+- 負担する人は、その月の `category_month_shares` に含まれるメンバーでなければならない（割合は0%でよい）。
 
 ### 月次集計
 
@@ -131,7 +145,7 @@
 
 - 支払額：そのメンバーが支払った支出の合計
 - 負担額：次の合計
-  - 費目ごとに、`category` の支出の月合計 × その月の割合（端数処理は2章）
+  - 費目ごとに、`category` の支出の月合計 × その月の割合（端数処理は2章。上限額つきの費目は前節のとおり）
   - `category` 以外の支出の `expense_allocations.burden_minor`
 - 差額：支払額 - 負担額
 
@@ -165,7 +179,7 @@ Workerで次をすべて確認してから締める。
 2. メンバーごとの支払額・負担額・差額を計算
 3. 送金元・送金先・金額の組み合わせを計算
 4. 1回の `batch()` で次を書く（8章の競合制御つき）
-   - 割合の行が無い費目の `category_month_shares`
+   - 行が無い費目の `category_month_settings`・`category_month_shares`（引き継いだ設定を書き、確定値として残す）
    - `monthly_closings`
    - `closing_member_summaries`
    - `closing_category_burdens`（費目ごとの合計と、メンバーごとの負担額。履歴画面の内訳用）
@@ -248,7 +262,7 @@ Workerで次をすべて確認してから締める。
 
 最後の1人が脱退したとき、またはアカウントを削除したときに、そのグループのデータをすべて物理削除する。外部キーに `ON DELETE CASCADE` を付けていないため、1回の `batch()` で子から順に消す。
 
-`settlement_transfers` → `closing_category_burdens` → `closing_member_summaries` → `monthly_closings` → `expense_allocations` → `expenses` → `recurring_expense_runs` → `recurring_expense_allocations` → `recurring_expenses` → `category_month_shares` → `categories` → `invites` → `group_members` → `expense_groups`
+`settlement_transfers` → `closing_category_burdens` → `closing_member_summaries` → `monthly_closings` → `expense_allocations` → `expenses` → `recurring_expense_runs` → `recurring_expense_allocations` → `recurring_expenses` → `category_month_shares` → `category_month_settings` → `categories` → `invites` → `group_members` → `expense_groups`
 
 ### アカウント削除
 
@@ -293,6 +307,7 @@ Workerで次をすべて確認してから締める。
 | テーブル | 役割 |
 |---|---|
 | `categories` | グループごとの費目。削除せずアーカイブ |
+| `category_month_settings` | 月ごとの費目別の設定（上限額つきの負担） |
 | `category_month_shares` | 月ごとの費目別・メンバー別負担割合 |
 | `expenses` | 支出本体 |
 | `expense_allocations` | `category` 以外の支出の、メンバー別確定負担額 |
@@ -467,7 +482,7 @@ Webからのアカウント削除依頼（Google Play向け）の本人確認は
 |---|---|
 | `0001_auth.sql` | users / identities / sessions / used_nonces（Singfolioと同じ） |
 | `0002_groups_members.sql` | expense_groups / group_members / invites |
-| `0003_categories.sql` | categories / category_month_shares |
+| `0003_categories.sql` | categories / category_month_settings / category_month_shares |
 | `0004_recurring_expenses.sql` | recurring_expenses / recurring_expense_allocations |
 | `0005_expenses.sql` | expenses / expense_allocations / recurring_expense_runs |
 | `0006_closings_settlements.sql` | monthly_closings / closing_member_summaries / closing_category_burdens / settlement_transfers |
@@ -487,6 +502,7 @@ D1のローカル環境で、全マイグレーションを最初から適用で
 - 端数が出る場合の固定順配分（割合0%のメンバーには配らない）
 - 支払者と負担者が異なるケース
 - 費目の月合計 × 割合で計算されること（企画メモ5章の精算例が、相手から自分へ17,000円になる）
+- 上限額つきの負担：月合計が上限以下・ちょうど上限・上限超えの3通り。超えた分の割合を、負担する人0%・0%以外の両方で
 - 月の途中で割合を変えると、その月の `category` の支出すべてに反映されること
 - 個別設定の支出が、費目の合計から除外されること
 - 割合の行が無い月が、直前の月の割合を引き継ぐこと
@@ -514,7 +530,7 @@ D1のローカル環境で、全マイグレーションを最初から適用で
 - 期限切れ・使用済み・取消済み招待の拒否
 - 同じ招待での同時参加で、1人だけ参加できること
 - 発行者の脱退確定・アカウント削除で、未使用の招待が取り消されること
-- 参加月の割合が均等にリセットされること、個別負担の固定費が止まること
+- 参加月の割合が均等にリセットされ、上限額の設定が外れること、個別負担の固定費が止まること
 - 異なるグループのIDを指定した操作の拒否
 - 参加月より前の履歴閲覧拒否
 - 脱退の取り消し（当月中）と、翌月以降の取り消しの拒否
@@ -667,7 +683,21 @@ CREATE TABLE categories (
 
 CREATE INDEX idx_categories_group ON categories (group_id);
 
--- 行が無い月は、その月以前で最も新しい月の行の組を使う（3章）。
+-- 行が無い月は、その月以前で最も新しい月の行と、同じ月の category_month_shares の組を使う（3章）。
+-- 上限額つきの負担を使わない月も、行は書く（どの月の設定を使うかを、この表の月で決めるため）。
+CREATE TABLE category_month_settings (
+  group_id TEXT NOT NULL,
+  category_id TEXT NOT NULL,
+  target_month TEXT NOT NULL CHECK (target_month GLOB '[0-9][0-9][0-9][0-9]-[01][0-9]'),
+  cap_member_id TEXT,
+  cap_minor INTEGER CHECK (cap_minor BETWEEN 1 AND 1000000000000),
+  PRIMARY KEY (category_id, target_month),
+  FOREIGN KEY (category_id, group_id) REFERENCES categories (id, group_id),
+  FOREIGN KEY (cap_member_id, group_id) REFERENCES group_members (id, group_id),
+  CHECK ((cap_member_id IS NULL) = (cap_minor IS NULL))
+) STRICT, WITHOUT ROWID;
+
+-- 超えた分の割合（上限額つきでなければ、月合計の割合）。category_month_settings と同じ月でまとめて書く。
 CREATE TABLE category_month_shares (
   group_id TEXT NOT NULL,
   category_id TEXT NOT NULL,
@@ -856,6 +886,7 @@ CREATE TABLE settlement_transfers (
 以下は複数行・複数テーブルにまたがるため、Worker側の検証と8章の競合制御で保証する。
 
 - `category_month_shares` の、1つの費目・月の割合合計が10000であること。
+- `category_month_settings` と `category_month_shares` が同じ月でまとめて書かれること。上限額を負担する人が、その月の `category_month_shares` に含まれること。
 - `expense_allocations.burden_minor` の合計が支出総額と一致すること。`category` の支出に行が無いこと。
 - 金額指定の各 `amount_minor` の合計が支出総額と一致すること。
 - 支払者・負担者が、支出の対象月に有効なメンバーであること。
