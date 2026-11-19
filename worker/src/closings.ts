@@ -128,8 +128,12 @@ export async function handleCloseMonth(
   // 月の行が無い費目は、引き継いだ設定をこの月の行として書き、確定値として残す（3章）。
   const inheritedSettings: (string | number | null)[][] = [];
   const inheritedShares: (string | number | null)[][] = [];
+  // アーカイブした費目は、その月に支出がなければ書かない（毎月、使わない行が増え続けるのを避ける）。設定は、
+  // 引き継ぐ元の行がそのまま使われる。アーカイブした費目の支出を未締めの月へ移しても、同じ。
+  const usedCategories = new Set(result.categories.map((category) => category.categoryId));
   for (const [categoryId, source] of state.rules) {
     if (source.sourceMonth >= month) continue;
+    if (source.archived && !usedCategories.has(categoryId)) continue;
     const cap = source.rule.cap ?? null;
     inheritedSettings.push([groupId, categoryId, month, cap?.memberId ?? null, cap?.capMinor ?? null]);
     for (const share of source.rule.shares) {

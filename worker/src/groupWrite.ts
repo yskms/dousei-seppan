@@ -62,6 +62,8 @@ export function insertRowsGuarded(
 ): D1PreparedStatement[] {
   const guardParameters = 2;
   const rowsPerStatement = Math.floor((MAX_BOUND_PARAMETERS - guardParameters) / columns.length);
+  // 1行も入らない列数だと、下のループが進まなくなる。
+  if (rowsPerStatement < 1) throw new Error(`列が多すぎて、1文に1行も入らない: ${table}（${columns.length}列）`);
   const statements: D1PreparedStatement[] = [];
   for (let start = 0; start < rows.length; start += rowsPerStatement) {
     const chunk = rows.slice(start, start + rowsPerStatement);

@@ -234,6 +234,62 @@ describe('送金の精算済み・繰越のAPI', () => {
       assert.equal((await api.closing(carol, g.groupId, '2026-10')).status, 404);
     });
 
+    it('繰り越した送金がある間は、脱退済み（left）にしない。繰越先の月を締め、その送金を精算済みにしてから', async () => {
+      // alice と carol が6,000円ずつ払い、bob は0円。bob → alice と bob → carol の2件（約2,000円ずつ）。
+      const g = await setup(['alice', 'bob', 'carol']);
+      const { alice, bob, carol } = g.people;
+      await pay(g, alice, 6000);
+      await pay(g, carol, 6000);
+      const october = (await api.close(alice, g.groupId, '2026-10')).body;
+      const toAlice = october.transfers.find((t: TransferView) => t.toMemberId === alice.memberId) as TransferView;
+      const toCarol = october.transfers.find((t: TransferView) => t.toMemberId === carol.memberId) as TransferView;
+      assert.equal((await api.carry(bob, toAlice.id)).status, 200);
+
+      // 10月を早めに締めたあとで、bob が脱退を選ぶと、その場で確定する（5章の2。脱退APIは13章の7）。
+      await db
+        .prepare(`UPDATE group_members SET status = 'leaving', expense_end_month = '2026-10' WHERE id = ?`)
+        .bind(bob.memberId)
+        .run();
+
+      // 未処理の送金は無くなるが、繰り越した分は、11月を締めるまでどの送金にも入っていない。
+      assert.equal((await api.settle(carol, toCarol.id)).status, 200);
+      assert.equal((await memberRow(bob.memberId))!.status, 'leaving');
+
+      // 11月を締めると、繰越が bob → alice の送金になる。bob は leaving のまま、これを見て精算済みにできる。
+      const november = (await api.close(alice, g.groupId, '2026-11')).body;
+      assert.deepEqual(
+        november.transfers.map((t: TransferView) => [t.fromMemberId, t.toMemberId, t.amountMinor, t.canCarry]),
+        [[bob.memberId, alice.memberId, toAlice.amountMinor, false]],
+      );
+      assert.equal((await memberRow(bob.memberId))!.status, 'leaving');
+      assert.equal((await api.summary(bob, g.groupId, '2026-11')).status, 200);
+      assert.equal((await api.settle(bob, november.transfers[0].id)).status, 200);
+      assert.deepEqual(await memberRow(bob.memberId), { status: 'left', left_at: NOW });
+    });
+
+    it('繰越先の月を締めたあとなら、繰り越した送金は脱退済みの妨げにならない', async () => {
+      const g = await setup(['alice', 'bob', 'carol']);
+      const { alice, bob, carol } = g.people;
+      await pay(g, alice, 6000);
+      await pay(g, carol, 6000);
+      const october = (await api.close(alice, g.groupId, '2026-10')).body;
+      const toAlice = october.transfers.find((t: TransferView) => t.toMemberId === alice.memberId) as TransferView;
+      const toCarol = october.transfers.find((t: TransferView) => t.toMemberId === carol.memberId) as TransferView;
+      assert.equal((await api.carry(bob, toAlice.id)).status, 200);
+      assert.equal((await api.settle(carol, toCarol.id)).status, 200);
+      // 11月を締めて、繰越が11月の送金になってから、bob が11月で脱退する。
+      const november = (await api.close(alice, g.groupId, '2026-11')).body;
+      await db
+        .prepare(`UPDATE group_members SET status = 'leaving', expense_end_month = '2026-11' WHERE id = ?`)
+        .bind(bob.memberId)
+        .run();
+      // 11月の送金（pending）が残る間は leaving。
+      assert.equal((await memberRow(bob.memberId))!.status, 'leaving');
+      // 11月の送金を精算済みにすると、10月の繰越は11月に合算済みなので、脱退済みになる。
+      assert.equal((await api.settle(alice, november.transfers[0].id)).status, 200);
+      assert.equal((await memberRow(bob.memberId))!.status, 'left');
+    });
+
     it('leaving のメンバーも、精算済みにできる（グループのデータを見られ、精算に参加する）', async () => {
       const g = await setup(['alice', 'bob', 'carol'], { carol: { status: 'leaving', expenseEndMonth: '2026-10' } });
       await pay(g, g.people.alice, 9000);

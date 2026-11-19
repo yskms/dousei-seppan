@@ -118,3 +118,31 @@ export function interferingEnv(
   });
   return { ...env, DB: proxy };
 }
+
+/**
+ * DBに作られた文の数（`prepare` の呼び出し。どの文も1回だけ実行するので、D1のクエリ数と同じ）と、`batch` ごとの
+ * 文の数を、呼ばれた順に記録するDB。D1は batch の1文を1クエリと数え、Freeは1回の呼び出しにつき50まで。
+ * 月締めは、状態の読み込み・書き込み・締め結果の読み込みの順に batch が3回。
+ */
+export function countingEnv(env: Env): { env: Env; counts: { queries: number; batchSizes: number[] } } {
+  const counts = { queries: 0, batchSizes: [] as number[] };
+  const proxy = new Proxy(env.DB, {
+    get(target, property) {
+      if (property === 'prepare') {
+        return (sql: string) => {
+          counts.queries += 1;
+          return target.prepare(sql);
+        };
+      }
+      if (property === 'batch') {
+        return (statements: D1PreparedStatement[]) => {
+          counts.batchSizes.push(statements.length);
+          return target.batch(statements);
+        };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  return { env: { ...env, DB: proxy }, counts };
+}

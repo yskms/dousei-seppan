@@ -15,7 +15,7 @@ import {
   type Person,
 } from './apiFixture.ts';
 import { openLocalDatabase, type LocalDatabase } from './localDatabase.ts';
-import { interferingEnv, monthApi, NOW_DECEMBER, read, request } from './monthApi.ts';
+import { countingEnv, interferingEnv, monthApi, NOW_DECEMBER, read, request } from './monthApi.ts';
 
 describe('月次集計・月締め・締め結果のAPI', () => {
   let local: LocalDatabase;
@@ -468,8 +468,12 @@ describe('月次集計・月締め・締め結果のAPI', () => {
         await pay(g, g.people.alice, 1000, '2026-11');
         assert.equal((await api.close(g.people.alice, g.groupId, '2026-11')).status, 201);
 
+        // 締め済みではないので、`month_closed` ではなく `month_skipped`。summary も、`closed: false` のまま同じ理由を返す。
         const result = await api.close(g.people.alice, g.groupId, '2026-10');
-        assert.deepEqual([result.status, result.body], [409, { error: 'month_closed' }]);
+        assert.deepEqual([result.status, result.body], [409, { error: 'month_skipped' }]);
+        const summary = await api.summary(g.people.alice, g.groupId, '2026-10');
+        assert.equal(summary.body.closed, false);
+        assert.deepEqual(summary.body.close, { closable: false, reason: 'month_skipped' });
       });
     });
 
@@ -663,6 +667,34 @@ describe('月次集計・月締め・締め結果のAPI', () => {
         assert.equal(shares.length, 4);
       });
 
+      it('アーカイブした費目は、その月に支出がなければ、設定を引き継いで書かない（支出があれば書く）', async () => {
+        const g = await setup(['alice', 'bob']);
+        const { alice, bob } = g.people;
+        const ids = [alice.memberId, bob.memberId];
+        const unused = await factory.addCategory(g.groupId, 'unused', true);
+        const used = await factory.addCategory(g.groupId, 'used', true);
+        for (const categoryId of [unused, used]) await insertCategoryRule(db, g.groupId, categoryId, '2026-10', equalShares(ids));
+        assert.equal((await api.close(alice, g.groupId, '2026-10')).status, 201);
+
+        // 11月は、アーカイブした費目 used の支出だけがある（アーカイブしても、費目を変えなければ編集できる）。
+        await pay(g, alice, 2000, '2026-11', undefined, used);
+        const november = await api.close(alice, g.groupId, '2026-11');
+        assert.equal(november.status, 201, JSON.stringify(november.body));
+        assert.equal(november.body.categories.length, 1);
+
+        const written = (
+          await db
+            .prepare(`SELECT category_id FROM category_month_settings WHERE group_id = ? AND target_month = '2026-11'`)
+            .bind(g.groupId)
+            .all<{ category_id: string }>()
+        ).results.map((row) => row.category_id);
+        assert.deepEqual(written.sort(), [g.categoryId, used].sort());
+        assert.equal(
+          (await db.prepare(`SELECT count(*) AS n FROM category_month_shares WHERE group_id = ? AND target_month = '2026-11' AND category_id = ?`).bind(g.groupId, unused).first<{ n: number }>())!.n,
+          0,
+        );
+      });
+
       it('費目やメンバーが多く、1文に収まらない行数でも、締められる（複数行のINSERTを分ける）', async () => {
         const g = await setup(['alice', 'bob', 'carol']);
         const { alice, bob, carol } = g.people;
@@ -690,6 +722,38 @@ describe('月次集計・月締め・締め結果のAPI', () => {
           (await db.prepare(`SELECT count(*) AS n FROM category_month_shares WHERE group_id = ? AND target_month = '2026-11'`).bind(g.groupId).first<{ n: number }>())!.n,
           13 * 3,
         );
+      });
+    });
+
+    describe('D1のクエリ数（Freeは1回の呼び出しにつき50まで）', () => {
+      // 行ごとのINSERTに戻すと、費目13・メンバー3の月締めで、書き込みだけで100文近くになる。
+      it('行数が多い月締めでも、複数行を1文にまとめているので、文の数が少ない', async () => {
+        const g = await setup(['alice', 'bob', 'carol']);
+        const { alice } = g.people;
+        const ids = [alice, g.people.bob, g.people.carol].map((p) => p.memberId);
+        const categoryIds = [g.categoryId];
+        for (let i = 0; i < 12; i += 1) {
+          const categoryId = await factory.addCategory(g.groupId, `c${i}`);
+          await insertCategoryRule(db, g.groupId, categoryId, '2026-10', equalShares(ids));
+          categoryIds.push(categoryId);
+        }
+        for (const categoryId of categoryIds) await pay(g, alice, 3000, '2026-10', undefined, categoryId);
+        const october = await api.close(alice, g.groupId, '2026-10');
+        for (const transfer of october.body.transfers) assert.equal((await api.settle(alice, transfer.id)).status, 200);
+
+        // 11月は、全費目の設定を引き継ぎ（13行 + 割合39行）、全費目に支出がある（負担39行）。
+        for (const categoryId of categoryIds) await pay(g, alice, 3000, '2026-11', undefined, categoryId);
+        const counting = countingEnv(env);
+        const november = await api.close(alice, g.groupId, '2026-11', { env: counting.env });
+        assert.equal(november.status, 201, JSON.stringify(november.body));
+        assert.equal(await count('category_month_shares', g.groupId), 13 * 3 * 2);
+
+        // 書き込みの batch は2回目。バージョンの更新1 + 設定1 + 割合3 + 締め1 + 集計1 + 負担3 + 送金1 + 脱退1。
+        const [stateReads, writes, viewReads] = counting.counts.batchSizes;
+        assert.deepEqual([stateReads, viewReads], [10, 5]);
+        assert.equal(writes, 12);
+        // 認証・バージョン・権限の読み込みを含めて、Freeの上限（50）に十分収まる。
+        assert.ok(counting.counts.queries <= 35, `クエリ数 ${counting.counts.queries}`);
       });
     });
 

@@ -408,5 +408,14 @@ describe('グループ単位の楽観ロック（8章）', () => {
       const f = await addGroup();
       assert.deepEqual(insertRowsGuarded(db, 'token', f.groupId, 'category_month_shares', columns, []), []);
     });
+
+    it('列が多すぎて1行も入らないときは、無限ループにせず投げる', async () => {
+      const f = await addGroup();
+      const tooMany = Array.from({ length: 99 }, (_, index) => `c${index}`);
+      assert.throws(
+        () => insertRowsGuarded(db, 'token', f.groupId, 'category_month_shares', tooMany, [[...tooMany]]),
+        /1文に1行も入らない/,
+      );
+    });
   });
 });

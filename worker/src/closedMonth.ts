@@ -43,9 +43,13 @@ export function transferJson(row: TransferRow, canCarry: boolean) {
 
 /**
  * 脱退が確定した（`leaving`）メンバーを、脱退済み（`left`）にする文（5章「脱退」の4）。
- * 脱退月が締められ、そのメンバーが関わる未処理（pending）の送金が無いときだけ変わる。月締め（送金が0件なら、
- * 締めた時点で脱退済み）と、精算の処理の中で呼ぶ。`memberIds` を渡せば、そのメンバーだけが対象。
- * 繰越済み（carried）の送金は、翌月の精算に合算済みなので、未処理に数えない。
+ * 次をすべて満たすときだけ変わる。月締め（送金が0件なら、締めた時点で脱退済み）と、精算の処理の中で呼ぶ。
+ * `memberIds` を渡せば、そのメンバーだけが対象。
+ * - 脱退月が締められている。
+ * - そのメンバーが関わる未処理（pending）の送金が無い。
+ * - そのメンバーが関わる繰越済み（carried）の送金は、繰越先（締めた月の翌月）がすでに締められている。繰り越した額は、
+ *   翌月を締めるまで、どの送金にも入っていない（翌月の締めで、送金に作り直される）。翌月が未締めのうちに脱退済みに
+ *   すると、翌月にそのメンバーが関わる送金ができても、本人は見られず、精算できない。
  * GROUP_WRITE_GUARD の条件つき（8章）。
  */
 export function markLeftStatement(
@@ -65,6 +69,13 @@ export function markLeftStatement(
           AND NOT EXISTS (SELECT 1 FROM settlement_transfers t
                            WHERE t.group_id = group_members.group_id AND t.status = 'pending'
                              AND (t.from_member_id = group_members.id OR t.to_member_id = group_members.id))
+          AND NOT EXISTS (SELECT 1 FROM settlement_transfers t
+                            JOIN monthly_closings tc ON tc.id = t.closing_id AND tc.group_id = t.group_id
+                           WHERE t.group_id = group_members.group_id AND t.status = 'carried'
+                             AND (t.from_member_id = group_members.id OR t.to_member_id = group_members.id)
+                             AND NOT EXISTS (SELECT 1 FROM monthly_closings nc
+                                              WHERE nc.group_id = t.group_id
+                                                AND nc.target_month = strftime('%Y-%m', tc.target_month || '-01', '+1 month')))
           AND EXISTS (${GROUP_WRITE_GUARD})`,
     )
     .bind(now, groupId, ...(memberIds ?? []), groupId, token);

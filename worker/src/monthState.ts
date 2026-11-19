@@ -29,6 +29,8 @@ export interface MemberInfo {
 export interface CategoryRuleSource {
   /** どの月の行か。対象の月より前なら、引き継いだもの。 */
   sourceMonth: string;
+  /** 費目をアーカイブしているか。月締めで設定を引き継いで書くとき、使っていないアーカイブ済みの費目は書かない。 */
+  archived: boolean;
   rule: CategoryRule;
 }
 
@@ -102,7 +104,7 @@ export async function loadMonthState(db: D1Database, groupId: string, month: str
     // 費目ごとに、その月以前で最も新しい月の設定を、主キーで引く（費目の数だけ。月の数には比例しない）。
     db
       .prepare(
-        `SELECT s.category_id AS category_id, s.target_month AS source_month,
+        `SELECT s.category_id AS category_id, s.target_month AS source_month, c.archived_at IS NOT NULL AS archived,
                 s.cap_member_id AS cap_member_id, s.cap_minor AS cap_minor
            FROM categories c
            JOIN category_month_settings s ON s.category_id = c.id AND s.target_month = ${currentRule}
@@ -173,11 +175,13 @@ export async function loadMonthState(db: D1Database, groupId: string, month: str
   for (const row of settings.results as {
     category_id: string;
     source_month: string;
+    archived: number;
     cap_member_id: string | null;
     cap_minor: number | null;
   }[]) {
     rules.set(row.category_id, {
       sourceMonth: row.source_month,
+      archived: row.archived === 1,
       rule: {
         categoryId: row.category_id,
         shares: shareMap.get(row.category_id) ?? [],
@@ -263,6 +267,8 @@ export function computeMonthFromState(state: MonthState, month: string): Compute
 export type CloseBlock =
   | { reason: 'forbidden' }
   | { reason: 'month_closed' }
+  /** 締めていないが、最後に締めた月より前（飛ばした月）。締め済みではないので、`month_closed` と区別する。 */
+  | { reason: 'month_skipped' }
   | { reason: 'month_not_started' }
   | { reason: 'previous_month_not_closed' | 'previous_month_unsettled'; month: string };
 
@@ -270,7 +276,8 @@ export type CloseBlock =
  * 月を締められるか（4章「月締めの条件」）。締められれば null。
  *
  * - 操作者が、その月のメンバーであること（参加前の月、脱退月が終わった月は、締められない）。
- * - 最後に締めた月以前は、締めていなくても `month_closed`（月は古い順にしか締めないので、飛ばした月は締められない）。
+ * - すでに締めた月は `month_closed`。最後に締めた月より前で、締めていない月（飛ばした月）は `month_skipped`
+ *   （月は古い順にしか締めないので、締められない）。
  * - 前の月が締め済みなら、その送金がすべて処理済み（settled / carried）であること。
  * - 前の月が未締めなら、締められない。例外は、グループで最初の月（締めがまだ1つも無く、最初の支出がある月以前。
  *   支出が無ければ作成月以前）。作成月に支出が無く、翌月に最初の支出を登録したグループは、作成月を締めずに、
@@ -278,10 +285,9 @@ export type CloseBlock =
  */
 export function evaluateClose(state: MonthState, access: GroupAccess, month: string, now: number): CloseBlock | null {
   if (!participatesInMonth(access.member, month)) return { reason: 'forbidden' };
-  const closed =
-    state.closings.some((closing) => closing.month === month) ||
-    (state.latestClosedMonth !== null && month <= state.latestClosedMonth);
-  if (closed) return { reason: 'month_closed' };
+  if (state.closings.some((closing) => closing.month === month)) return { reason: 'month_closed' };
+  // 最後に締めた月自身は上で `month_closed` になっているので、ここに来るのは、それより前の月だけ。
+  if (state.latestClosedMonth !== null && month < state.latestClosedMonth) return { reason: 'month_skipped' };
   if (month > monthIn(access.group.timezone, now)) return { reason: 'month_not_started' };
 
   const previous = previousMonth(month);
