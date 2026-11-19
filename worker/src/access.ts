@@ -33,6 +33,8 @@ export interface GroupAccess {
     historyFromMonth: string;
     /** 「今月で脱退する」を選んだ月（脱退月）。選んでいなければ null。確定するまで `status` は `active` のまま。 */
     leaveRequestedMonth: string | null;
+    /** 脱退が確定した月（脱退月）。確定していなければ null。 */
+    expenseEndMonth: string | null;
   };
 }
 
@@ -46,6 +48,7 @@ interface AccessRow {
   status: 'active' | 'leaving';
   history_from_month: string;
   leave_requested_month: string | null;
+  expense_end_month: string | null;
 }
 
 /**
@@ -59,7 +62,7 @@ export async function loadGroupAccess(db: D1Database, userId: string, groupId: s
       `SELECT g.id AS group_id, g.currency_code AS currency_code, g.currency_minor_unit AS currency_minor_unit,
               g.timezone AS timezone, g.created_at AS created_at,
               m.id AS member_id, m.status AS status, m.history_from_month AS history_from_month,
-              m.leave_requested_month AS leave_requested_month
+              m.leave_requested_month AS leave_requested_month, m.expense_end_month AS expense_end_month
          FROM group_members m JOIN expense_groups g ON g.id = m.group_id
         WHERE m.group_id = ?1 AND m.user_id = ?2 AND m.status IN ('active', 'leaving')`,
     )
@@ -79,6 +82,7 @@ export async function loadGroupAccess(db: D1Database, userId: string, groupId: s
       status: row.status,
       historyFromMonth: row.history_from_month,
       leaveRequestedMonth: row.leave_requested_month,
+      expenseEndMonth: row.expense_end_month,
     },
   };
 }
@@ -86,6 +90,20 @@ export async function loadGroupAccess(db: D1Database, userId: string, groupId: s
 /** その月のデータを見てよいか。新しいメンバーが見られるのは、参加（復帰）した月以降（5章）。 */
 export function canViewMonth(access: GroupAccess, month: string): boolean {
   return month >= access.member.historyFromMonth;
+}
+
+/**
+ * メンバーが、その月の集計に入る月か。参加（復帰）した月から、脱退月まで（脱退が確定していれば
+ * `expenseEndMonth`、脱退を選んだだけなら `leaveRequestedMonth`）。`status` は見ない。削除したユーザーも、
+ * 削除した月までは集計に含める（5章）。月締めを操作できるのも、この月のメンバー（4章）。
+ */
+export function participatesInMonth(
+  member: { historyFromMonth: string; expenseEndMonth: string | null; leaveRequestedMonth: string | null },
+  month: string,
+): boolean {
+  if (month < member.historyFromMonth) return false;
+  const lastMonth = member.expenseEndMonth ?? member.leaveRequestedMonth;
+  return lastMonth === null || month <= lastMonth;
 }
 
 /**

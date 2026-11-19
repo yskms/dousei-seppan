@@ -38,6 +38,21 @@ export interface Fixture {
   other: { groupId: string; categoryId: string; member: Person };
 }
 
+export interface MemberOptions {
+  status?: string;
+  historyFromMonth?: string;
+  leaveRequestedMonth?: string | null;
+  expenseEndMonth?: string | null;
+}
+
+/** 月締め・精算の検査用の、小さなグループ。メンバーは名前で引く（`people.alice`）。 */
+export interface SimpleGroup<Name extends string = string> {
+  groupId: string;
+  /** 使える費目（1つ）。 */
+  categoryId: string;
+  people: Record<Name, Person>;
+}
+
 let seq = 0;
 
 export function createFixtureFactory(db: D1Database) {
@@ -78,15 +93,15 @@ export function createFixtureFactory(db: D1Database) {
     groupId: string,
     name: string,
     userId: string | null,
-    options: { status?: string; historyFromMonth?: string; expenseEndMonth?: string | null } = {},
+    options: MemberOptions = {},
   ): Promise<string> => {
     // メンバーIDは「名前-番号」。名前の昇順がIDの昇順になる（端数を配る固定順をテストで読めるように）。
     const memberId = `${name}-${++seq}`;
     await db
       .prepare(
         `INSERT INTO group_members (id, group_id, user_id, display_name, color, status, history_from_month,
-           expense_end_month, joined_at)
-         VALUES (?, ?, ?, ?, 'pink', ?, ?, ?, ?)`,
+           leave_requested_month, expense_end_month, joined_at)
+         VALUES (?, ?, ?, ?, 'pink', ?, ?, ?, ?, ?)`,
       )
       .bind(
         memberId,
@@ -95,6 +110,7 @@ export function createFixtureFactory(db: D1Database) {
         name,
         options.status ?? 'active',
         options.historyFromMonth ?? '2026-10',
+        options.leaveRequestedMonth ?? null,
         options.expenseEndMonth ?? null,
         GROUP_CREATED_AT,
       )
@@ -123,7 +139,18 @@ export function createFixtureFactory(db: D1Database) {
     return { userId, token, memberId: await insertMember(groupId, name, userId, options) };
   };
 
-  return async function createFixture(): Promise<Fixture> {
+  /** 指定した名前のメンバー（既定は2026-10から参加中）と、費目1つだけのグループ。作成月は2026-10。 */
+  const createGroup = async <Name extends string>(
+    names: readonly Name[],
+    optionsByName: Partial<Record<Name, MemberOptions>> = {},
+  ): Promise<SimpleGroup<Name>> => {
+    const groupId = await insertGroup('simple');
+    const people = {} as Record<Name, Person>;
+    for (const name of names) people[name] = await personIn(groupId, name, optionsByName[name] ?? {});
+    return { groupId, categoryId: await insertCategory(groupId, 'food'), people };
+  };
+
+  const createFixture = async function createFixture(): Promise<Fixture> {
     const groupId = await insertGroup('main');
     const alice = await personIn(groupId, 'alice');
     const bob = await personIn(groupId, 'bob');
@@ -152,6 +179,86 @@ export function createFixtureFactory(db: D1Database) {
       other: { groupId: otherGroupId, categoryId: otherCategoryId, member: otherMember },
     };
   };
+
+  return Object.assign(createFixture, { createGroup, addCategory: insertCategory });
+}
+
+/** 割合の合計が10000になる均等割り。端数は、IDの昇順の先頭から1ずつ（2章）。 */
+export const equalShares = (ids: readonly string[]): [string, number][] => {
+  const base = Math.floor(10000 / ids.length);
+  const rest = 10000 - base * ids.length;
+  return [...ids].sort().map((id, index) => [id, base + (index < rest ? 1 : 0)]);
+};
+
+/** 費目のある月の割合と上限額（3章）。割合の合計は10000にすること（検査はしない）。 */
+export async function insertCategoryRule(
+  db: D1Database,
+  groupId: string,
+  categoryId: string,
+  month: string,
+  shares: readonly (readonly [memberId: string, basisPoints: number])[],
+  cap: { memberId: string; capMinor: number } | null = null,
+) {
+  await db.batch([
+    db
+      .prepare(
+        `INSERT INTO category_month_settings (group_id, category_id, target_month, cap_member_id, cap_minor)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .bind(groupId, categoryId, month, cap?.memberId ?? null, cap?.capMinor ?? null),
+    ...shares.map(([memberId, basisPoints]) =>
+      db
+        .prepare(
+          `INSERT INTO category_month_shares (group_id, category_id, target_month, member_id, share_basis_points)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        .bind(groupId, categoryId, month, memberId, basisPoints),
+    ),
+  ]);
+}
+
+/** 支出を直接書く（登録の検査は支出のAPIのテストで済んでいるので、集計の検査では行だけ作る）。 */
+export async function insertExpenseRow(
+  db: D1Database,
+  expense: {
+    groupId: string;
+    categoryId: string;
+    payerMemberId: string;
+    amountMinor: number;
+    targetMonth: string;
+    /** `category` 以外のとき、メンバーごとの負担額（合計は金額と一致させること）。 */
+    split?: { method: 'equal' | 'ratio' | 'fixed' | 'single'; allocations: readonly (readonly [string, number])[] };
+  },
+): Promise<string> {
+  const id = `expense-${++seq}`;
+  await db.batch([
+    db
+      .prepare(
+        `INSERT INTO expenses (id, group_id, expense_date, target_month, description, amount_minor, category_id,
+           payer_member_id, created_by_member_id, split_method, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?7, ?8, ?9, ?9)`,
+      )
+      .bind(
+        id,
+        expense.groupId,
+        `${expense.targetMonth}-15`,
+        expense.targetMonth,
+        expense.amountMinor,
+        expense.categoryId,
+        expense.payerMemberId,
+        expense.split?.method ?? 'category',
+        NOW,
+      ),
+    ...(expense.split?.allocations ?? []).map(([memberId, burdenMinor]) =>
+      db
+        .prepare(
+          `INSERT INTO expense_allocations (group_id, expense_id, member_id, burden_minor, share_basis_points)
+           VALUES (?, ?, ?, ?, NULL)`,
+        )
+        .bind(expense.groupId, id, memberId, burdenMinor),
+    ),
+  ]);
+  return id;
 }
 
 /** 月を締める（締めの中身は、支出のAPIの検査に要らないので、行だけを書く）。 */

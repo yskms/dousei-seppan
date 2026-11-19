@@ -30,6 +30,15 @@ export function nextMonth(month: string): string {
   return mon === 12 ? `${String(year + 1).padStart(4, '0')}-01` : `${match[1]}-${String(mon + 1).padStart(2, '0')}`;
 }
 
+export function previousMonth(month: string): string {
+  const match = MONTH_PATTERN.exec(month);
+  if (match === null) throw new Error(`月の形式が違う: ${month}`);
+  const year = Number(match[1]);
+  const mon = Number(match[2]);
+  if (year === 0 && mon === 1) throw new Error('0000-01 より前の月は無い');
+  return mon === 1 ? `${String(year - 1).padStart(4, '0')}-12` : `${match[1]}-${String(mon - 1).padStart(2, '0')}`;
+}
+
 export function maxMonth(a: string, b: string): string {
   return a >= b ? a : b;
 }

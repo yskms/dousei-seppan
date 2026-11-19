@@ -44,6 +44,42 @@ export type GroupWriteResult =
    */
   | { ok: false; reason: 'unique' };
 
+/** D1の、1つの文に束縛できる値の上限。 */
+const MAX_BOUND_PARAMETERS = 100;
+
+/**
+ * 同じ表への複数行のINSERT。GROUP_WRITE_GUARD の条件つき。D1はbatchの1文を1クエリと数える（Freeは1回の
+ * 呼び出しにつき50）ので、月締めのように行数が多い書き込みは、束縛の上限（100）に収まる範囲で、複数行を
+ * 1文にまとめる。`rows` の各行は `columns` と同じ順の値。行が無ければ、文も作らない。
+ */
+export function insertRowsGuarded(
+  db: D1Database,
+  token: string,
+  groupId: string,
+  table: string,
+  columns: readonly string[],
+  rows: readonly (readonly (string | number | null)[])[],
+): D1PreparedStatement[] {
+  const guardParameters = 2;
+  const rowsPerStatement = Math.floor((MAX_BOUND_PARAMETERS - guardParameters) / columns.length);
+  const statements: D1PreparedStatement[] = [];
+  for (let start = 0; start < rows.length; start += rowsPerStatement) {
+    const chunk = rows.slice(start, start + rowsPerStatement);
+    const placeholders = `(${columns.map(() => '?').join(', ')})`;
+    const selected = columns.map((_, index) => `column${index + 1}`).join(', ');
+    statements.push(
+      db
+        .prepare(
+          `INSERT INTO ${table} (${columns.join(', ')})
+           SELECT ${selected} FROM (VALUES ${chunk.map(() => placeholders).join(', ')})
+            WHERE EXISTS (${GROUP_WRITE_GUARD})`,
+        )
+        .bind(...chunk.flat(), groupId, token),
+    );
+  }
+  return statements;
+}
+
 /**
  * グループの現在の data_version。グループが無ければ null。
  * 書き込みに使うデータを読む「前に」呼ぶこと（ファイル冒頭の注意1）。

@@ -5,7 +5,13 @@
 // それらは、公開前に Workers の実環境で確認する（docs/backend-design.md 13章の9）。
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
-import { GROUP_WRITE_GUARD, isUniqueViolation, readDataVersion, writeToGroup } from '../src/groupWrite.ts';
+import {
+  GROUP_WRITE_GUARD,
+  insertRowsGuarded,
+  isUniqueViolation,
+  readDataVersion,
+  writeToGroup,
+} from '../src/groupWrite.ts';
 import { openLocalDatabase, type LocalDatabase } from './localDatabase.ts';
 
 describe('グループ単位の楽観ロック（8章）', () => {
@@ -356,6 +362,51 @@ describe('グループ単位の楽観ロック（8章）', () => {
       const result = await writeToGroup(db, 'no-such-group', 0, (token) => [insertExpense(f, token, id('expense'))]);
       assert.deepEqual(result, { ok: false, reason: 'version' });
       assert.equal(await countRows('expenses', f.groupId), 0);
+    });
+  });
+
+  describe('複数行のINSERT（insertRowsGuarded）', () => {
+    const columns = ['group_id', 'category_id', 'target_month', 'member_id', 'share_basis_points'];
+    /** 月だけが違う `count` 行（2000-01 から。主キーが重ならない）。 */
+    const rowsOf = (f: Fixture, count: number) =>
+      Array.from({ length: count }, (_, index) => [
+        f.groupId,
+        f.categoryId,
+        `${2000 + Math.floor(index / 12)}-${String((index % 12) + 1).padStart(2, '0')}`,
+        f.memberId,
+        5000,
+      ]);
+    const shareCount = async (groupId: string) =>
+      (await db.prepare('SELECT count(*) AS n FROM category_month_shares WHERE group_id = ?').bind(groupId).first<{ n: number }>())!.n;
+
+    it('束縛の上限（100）に収まるよう、複数の文に分けて書く（1文は19行）', async () => {
+      const f = await addGroup();
+      const statements = (token: string) => insertRowsGuarded(db, token, f.groupId, 'category_month_shares', columns, rowsOf(f, 60));
+      const result = await writeToGroup(db, f.groupId, 0, statements);
+
+      assert.ok(result.ok);
+      assert.deepEqual(
+        result.results.map((r) => r.meta.changes),
+        [19, 19, 19, 3],
+      );
+      assert.equal(await shareCount(f.groupId), 60);
+    });
+
+    it('古いバージョンでは、どの文も何も書かない', async () => {
+      const f = await addGroup();
+      assert.ok((await writeToGroup(db, f.groupId, 0, (token) => [insertExpense(f, token, id('expense'))])).ok);
+
+      // バージョン0を読んだ別のリクエストが、遅れて書く。
+      const result = await writeToGroup(db, f.groupId, 0, (token) =>
+        insertRowsGuarded(db, token, f.groupId, 'category_month_shares', columns, rowsOf(f, 40)),
+      );
+      assert.deepEqual(result, { ok: false, reason: 'version' });
+      assert.equal(await shareCount(f.groupId), 0);
+    });
+
+    it('行が無ければ、文を作らない', async () => {
+      const f = await addGroup();
+      assert.deepEqual(insertRowsGuarded(db, 'token', f.groupId, 'category_month_shares', columns, []), []);
     });
   });
 });
