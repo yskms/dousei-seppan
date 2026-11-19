@@ -1,7 +1,7 @@
 // 入口。エンドポイントは docs/backend-design.md 9章の順に足す。
 import { isId } from './expenseInput.ts';
 import { handleCreateExpense, handleDeleteExpense, handleListExpenses, handleUpdateExpense } from './expenses.ts';
-import { notFound, methodNotAllowed } from './http.ts';
+import { methodNotAllowed, notFound } from './http.ts';
 import { httpsRequiredResponse, isInsecureRequest } from './https.ts';
 
 const GROUP_EXPENSES_PATH = /^\/groups\/([^/]+)\/expenses$/;
@@ -33,9 +33,7 @@ export default {
       return methodNotAllowed('PATCH, DELETE');
     }
 
-    return new Response('Not Found', {
-      status: 404,
-      headers: { 'content-type': 'text/plain; charset=utf-8' },
-    });
+    // 他の404と同じ形にする（アプリがエラーをJSONとして読めるように）。
+    return notFound();
   },
 } satisfies ExportedHandler<Env>;

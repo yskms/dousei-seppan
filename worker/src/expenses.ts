@@ -111,12 +111,16 @@ interface MemberRow {
   status: 'active' | 'leaving' | 'left' | 'deleted';
   history_from_month: string;
   expense_end_month: string | null;
+  leave_requested_month: string | null;
 }
 
 /** グループの全メンバー（少人数。IN句のバインド数の上限を避けるため、まとめて読む）。 */
 async function loadMembers(db: D1Database, groupId: string): Promise<Map<string, MemberRow>> {
   const { results } = await db
-    .prepare('SELECT id, status, history_from_month, expense_end_month FROM group_members WHERE group_id = ?')
+    .prepare(
+      `SELECT id, status, history_from_month, expense_end_month, leave_requested_month
+         FROM group_members WHERE group_id = ?`,
+    )
     .bind(groupId)
     .all<MemberRow>();
   return new Map(results.map((row) => [row.id, row]));
@@ -124,13 +128,17 @@ async function loadMembers(db: D1Database, groupId: string): Promise<Map<string,
 
 /**
  * その月の支出の支払者・負担の対象にできるか（5章）。
- * 削除したユーザー・脱退済みは選べない。脱退が確定したメンバー（`leaving`）は、脱退月（`expense_end_month`）までの月なら選べる
- * （翌月以降は選べない）。参加（復帰）した月より前の月も選べない。
+ * 削除したユーザー・脱退済みは選べない。参加（復帰）した月より前の月も選べない。
+ * 最後の月は、脱退が確定していれば脱退月（`expense_end_month`）。脱退を選んだだけで、まだ確定していない
+ * （`leave_requested_month`）メンバーも、その翌月以降は選べない。翌月1日の確定はCronが書くので、確定を待つと、
+ * Cronが動くまでの間、翌月の支出に入ってしまう（あとで確定しても、保存した個別の負担額は戻らない）。
+ * 脱退月までは選べる（脱退月の支出を、脱退者の支払として登録できるように）。
  */
 function isMemberAvailable(member: MemberRow, month: string): boolean {
   if (member.status === 'deleted' || member.status === 'left') return false;
   if (month < member.history_from_month) return false;
-  if (member.expense_end_month !== null && month > member.expense_end_month) return false;
+  const lastMonth = member.expense_end_month ?? member.leave_requested_month;
+  if (lastMonth !== null && month > lastMonth) return false;
   return true;
 }
 
@@ -138,14 +146,20 @@ interface MemberRef {
   id: string;
   /** 失敗したときに返す項目名。 */
   field: string;
+  /** その月に使えることまで見るか。false なら、グループに居ることだけ見る。 */
+  checkAvailable: boolean;
 }
 
-/** グループに居て、その月に使えるメンバーか。居なければ400（他グループのIDなど）、使えなければ409。 */
+/**
+ * グループに居て（居なければ400。他グループのIDなど）、見る指定のものは、その月に使えるメンバーか（使えなければ409）。
+ */
 function checkMembers(members: Map<string, MemberRow>, refs: readonly MemberRef[], month: string): Response | null {
   for (const ref of refs) {
     const member = members.get(ref.id);
     if (member === undefined) return invalidRequest(ref.field);
-    if (!isMemberAvailable(member, month)) return conflict('member_not_available', { memberId: ref.id });
+    if (ref.checkAvailable && !isMemberAvailable(member, month)) {
+      return conflict('member_not_available', { memberId: ref.id });
+    }
   }
   return null;
 }
@@ -201,18 +215,19 @@ const monthNotRegisterable = (range: { from: string; to: string }): Response =>
 // ---------------------------------------------------------------------------
 // 負担額（個別設定）
 
-function splitMemberIds(split: SplitInput): string[] {
+/** 負担の指定に出てくるメンバーと、不備のときに返す項目名（`split.shares` など。入力の形と揃える）。 */
+function splitMemberRefs(split: SplitInput): { id: string; field: string }[] {
   switch (split.method) {
     case 'category':
       return [];
     case 'single':
-      return [split.memberId];
+      return [{ id: split.memberId, field: 'split.memberId' }];
     case 'equal':
-      return split.memberIds;
+      return split.memberIds.map((id) => ({ id, field: 'split.memberIds' }));
     case 'ratio':
-      return split.shares.map((share) => share.memberId);
+      return split.shares.map((share) => ({ id: share.memberId, field: 'split.shares' }));
     case 'fixed':
-      return split.amounts.map((item) => item.memberId);
+      return split.amounts.map((item) => ({ id: item.memberId, field: 'split.amounts' }));
   }
 }
 
@@ -403,7 +418,7 @@ export async function handleCreateExpense(request: Request, env: Env, now: numbe
   const outcome = await writeToGroupWithRetry<ExpenseJson, Response>(db, groupId, async () => {
     const access = await loadGroupAccess(db, session.userId, groupId);
     if (access === null) return { reject: notFound() };
-    if (!canWriteExpenses(access)) return { reject: forbidden() };
+    if (!canWriteExpenses(access, now)) return { reject: forbidden() };
 
     const [range, category, members] = await Promise.all([
       registerableMonths(db, access, now),
@@ -418,8 +433,8 @@ export async function handleCreateExpense(request: Request, env: Env, now: numbe
     const memberProblem = checkMembers(
       members,
       [
-        { id: input.payerMemberId, field: 'payerMemberId' },
-        ...splitMemberIds(input.split).map((id) => ({ id, field: 'split' })),
+        { id: input.payerMemberId, field: 'payerMemberId', checkAvailable: true },
+        ...splitMemberRefs(input.split).map((ref) => ({ ...ref, checkAvailable: true })),
       ],
       input.targetMonth,
     );
@@ -477,7 +492,8 @@ export async function handleUpdateExpense(
   const body = await readJsonObject(request, MAX_BODY_BYTES);
   if (!body.ok) return body.response;
   const parsed = parseUpdateExpense(body.body);
-  if (!parsed.ok) return invalidRequest(parsed.field);
+  // 空の本文は項目を特定できない（field は空文字）。応答には field を付けない。
+  if (!parsed.ok) return invalidRequest(parsed.field === '' ? undefined : parsed.field);
   const patch: UpdateExpenseInput = parsed.value;
   const db = env.DB;
 
@@ -489,7 +505,7 @@ export async function handleUpdateExpense(
     if (access === null) return { reject: notFound() };
     const current = await loadExpense(db, groupId, expenseId);
     if (current === null || !canViewMonth(access, current.target_month)) return { reject: notFound() };
-    if (!canWriteExpenses(access)) return { reject: forbidden() };
+    if (!canWriteExpenses(access, now)) return { reject: forbidden() };
     if (await isMonthClosed(db, groupId, current.target_month)) return { reject: conflict('month_closed') };
 
     const next: ExpenseRow = {
@@ -525,20 +541,7 @@ export async function handleUpdateExpense(
       if (category.archived) return { reject: conflict('category_not_available') };
     }
 
-    // 支払者・負担の対象は、変えたものだけを検証する（脱退・削除したメンバーが入った既存の支出でも、
-    // 内容や日付は直せる）。登録する月を変えるときは、その月に使えるかを全員分見る。
-    const storedIds = new Set(stored.map((allocation) => allocation.memberId));
-    const participantIds = patch.split !== undefined ? splitMemberIds(patch.split) : [...storedIds];
-    const refs: MemberRef[] = [];
-    if (monthChanged || next.payer_member_id !== current.payer_member_id) {
-      refs.push({ id: next.payer_member_id, field: 'payerMemberId' });
-    }
-    for (const id of participantIds) {
-      if (monthChanged || !storedIds.has(id)) refs.push({ id, field: 'split' });
-    }
-    const memberProblem = checkMembers(members, refs, next.target_month);
-    if (memberProblem !== null) return { reject: memberProblem };
-
+    // 負担額（個別設定）。`split` を送ったときだけ置き換える。
     let allocations = stored;
     let replaceAllocations = false;
     if (patch.split !== undefined) {
@@ -547,6 +550,33 @@ export async function handleUpdateExpense(
       allocations = built.allocations;
       replaceAllocations = !(patch.split.method === 'category' && current.split_method === 'category');
     }
+
+    // 支払者・負担の対象の検証。脱退・削除したメンバーが入った既存の支出でも、内容や日付は直せるように、
+    // その月に使えるかは「新しく選んだ・負担が増える」メンバーだけ見る（負担を増やせる＝選べる、と同じ扱い。
+    // 本人が異議を出せない相手に、負担を寄せ直せないようにする）。登録する月を変えるときは、全員分見直す。
+    // グループに居るかは、どのメンバーも必ず見る（他のグループのIDで外部キーに落ちないように）。
+    const storedBurden = new Map(stored.map((allocation) => [allocation.memberId, allocation.burdenMinor]));
+    const refs: MemberRef[] = [
+      {
+        id: next.payer_member_id,
+        field: 'payerMemberId',
+        checkAvailable: monthChanged || next.payer_member_id !== current.payer_member_id,
+      },
+    ];
+    if (patch.split !== undefined) {
+      const newBurden = new Map(allocations.map((allocation) => [allocation.memberId, allocation.burdenMinor]));
+      for (const ref of splitMemberRefs(patch.split)) {
+        const before = storedBurden.get(ref.id);
+        refs.push({
+          ...ref,
+          checkAvailable: monthChanged || before === undefined || (newBurden.get(ref.id) ?? 0) > before,
+        });
+      }
+    } else if (monthChanged) {
+      for (const memberId of storedBurden.keys()) refs.push({ id: memberId, field: 'split', checkAvailable: true });
+    }
+    const memberProblem = checkMembers(members, refs, next.target_month);
+    if (memberProblem !== null) return { reject: memberProblem };
 
     return {
       value: expenseJson(next, allocations),
@@ -581,7 +611,7 @@ export async function handleDeleteExpense(
     if (access === null) return { reject: notFound() };
     const current = await loadExpense(db, groupId, expenseId);
     if (current === null || !canViewMonth(access, current.target_month)) return { reject: notFound() };
-    if (!canWriteExpenses(access)) return { reject: forbidden() };
+    if (!canWriteExpenses(access, now)) return { reject: forbidden() };
     if (await isMonthClosed(db, groupId, current.target_month)) return { reject: conflict('month_closed') };
 
     return {

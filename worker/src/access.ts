@@ -3,6 +3,7 @@
 // 扱うAPIは、必ずここを通す。Premiumの閲覧期間の制限（企画メモ10章）を入れるときは、`canViewMonth` に足す。
 //
 // 他グループのID・メンバーでない人・脱退済みの人は、区別せず「無い」（404）として扱う（IDの存在を教えない）。
+import { monthIn } from './months.ts';
 import { authenticateSession, sessionTokenFromRequest, type AuthenticatedSession } from './session.ts';
 
 /** リクエストのセッションからユーザーを引く。無い・形が違う・期限切れなら null（401にする）。 */
@@ -30,6 +31,8 @@ export interface GroupAccess {
     /** `leaving` は、集計・締め・精算には参加でき、グループのデータも見られるが、支出は記録できない（5章）。 */
     status: 'active' | 'leaving';
     historyFromMonth: string;
+    /** 「今月で脱退する」を選んだ月（脱退月）。選んでいなければ null。確定するまで `status` は `active` のまま。 */
+    leaveRequestedMonth: string | null;
   };
 }
 
@@ -42,6 +45,7 @@ interface AccessRow {
   member_id: string;
   status: 'active' | 'leaving';
   history_from_month: string;
+  leave_requested_month: string | null;
 }
 
 /**
@@ -54,7 +58,8 @@ export async function loadGroupAccess(db: D1Database, userId: string, groupId: s
     .prepare(
       `SELECT g.id AS group_id, g.currency_code AS currency_code, g.currency_minor_unit AS currency_minor_unit,
               g.timezone AS timezone, g.created_at AS created_at,
-              m.id AS member_id, m.status AS status, m.history_from_month AS history_from_month
+              m.id AS member_id, m.status AS status, m.history_from_month AS history_from_month,
+              m.leave_requested_month AS leave_requested_month
          FROM group_members m JOIN expense_groups g ON g.id = m.group_id
         WHERE m.group_id = ?1 AND m.user_id = ?2 AND m.status IN ('active', 'leaving')`,
     )
@@ -69,7 +74,12 @@ export async function loadGroupAccess(db: D1Database, userId: string, groupId: s
       timezone: row.timezone,
       createdAt: row.created_at,
     },
-    member: { id: row.member_id, status: row.status, historyFromMonth: row.history_from_month },
+    member: {
+      id: row.member_id,
+      status: row.status,
+      historyFromMonth: row.history_from_month,
+      leaveRequestedMonth: row.leave_requested_month,
+    },
   };
 }
 
@@ -78,9 +88,17 @@ export function canViewMonth(access: GroupAccess, month: string): boolean {
   return month >= access.member.historyFromMonth;
 }
 
-/** 支出を記録（登録・編集・削除）してよいか。脱退が確定したメンバー（`leaving`）は記録できない（5章）。 */
-export function canWriteExpenses(access: GroupAccess): boolean {
-  return access.member.status === 'active';
+/**
+ * 支出を記録（登録・編集・削除）してよいか。脱退が確定したメンバー（`leaving`）は記録できない（5章）。
+ *
+ * 脱退は「脱退月を締めたとき、または翌月1日」に確定するが、翌月1日の確定はCron（1時間ごと。競合すれば次の回）が
+ * `status` を書く。確定を待たずに、脱退を選んだ月（`leaveRequestedMonth`）が終わったら、確定したものとして扱う
+ * （待つと、Cronが動くまでの間、脱退予定のメンバーが翌月の支出を記録できてしまう）。
+ */
+export function canWriteExpenses(access: GroupAccess, now: number): boolean {
+  if (access.member.status !== 'active') return false;
+  const leaveMonth = access.member.leaveRequestedMonth;
+  return leaveMonth === null || monthIn(access.group.timezone, now) <= leaveMonth;
 }
 
 /** 最後に締めた月。まだ締めていなければ null。 */

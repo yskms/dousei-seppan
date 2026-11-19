@@ -328,12 +328,35 @@ describe('支出のAPI', () => {
       assert.deepEqual(foreignCategory, { status: 400, body: { error: 'invalid_request', field: 'categoryId' } });
       const foreignPayer = await create(f, f.alice, body(f, { payerMemberId: f.other.member.memberId }));
       assert.deepEqual(foreignPayer, { status: 400, body: { error: 'invalid_request', field: 'payerMemberId' } });
-      const foreignSplit = await create(
-        f,
-        f.alice,
-        body(f, { split: { method: 'single', memberId: f.other.member.memberId } }),
-      );
-      assert.deepEqual(foreignSplit, { status: 400, body: { error: 'invalid_request', field: 'split' } });
+      const foreign = f.other.member.memberId;
+      const foreignSplits: [Record<string, unknown>, string][] = [
+        [{ method: 'single', memberId: foreign }, 'split.memberId'],
+        [{ method: 'equal', memberIds: [f.alice.memberId, foreign] }, 'split.memberIds'],
+        [
+          {
+            method: 'ratio',
+            shares: [
+              { memberId: f.alice.memberId, basisPoints: 5000 },
+              { memberId: foreign, basisPoints: 5000 },
+            ],
+          },
+          'split.shares',
+        ],
+        [
+          {
+            method: 'fixed',
+            amounts: [
+              { memberId: f.alice.memberId, amountMinor: 4000 },
+              { memberId: foreign, amountMinor: 280 },
+            ],
+          },
+          'split.amounts',
+        ],
+      ];
+      for (const [split, field] of foreignSplits) {
+        const result = await create(f, f.alice, body(f, { split }));
+        assert.deepEqual(result, { status: 400, body: { error: 'invalid_request', field } });
+      }
       assert.equal(await expenseCount(f.groupId), 0);
     });
 
@@ -372,6 +395,25 @@ describe('支出のAPI', () => {
         await insertClosing(db, f.groupId, '2026-11', f.alice.memberId);
         const afterEnd = await create(f, f.alice, body(f, { targetMonth: '2026-12', payerMemberId: f.carol.memberId }));
         assert.deepEqual(afterEnd, { status: 409, body: { error: 'member_not_available', memberId: f.carol.memberId } });
+      });
+
+      it('脱退を選んだ月（leave_requested_month）が終わったら、Cronの確定を待たずに、翌月の支払者・負担の対象に選べない', async () => {
+        const f = await createFixture();
+        // bob は 2026-10 で脱退する予定。いまは 2026-11 で、Cronはまだ確定していない（status は active のまま）。
+        await db.prepare(`UPDATE group_members SET leave_requested_month = '2026-10' WHERE id = ?`).bind(f.bob.memberId).run();
+        const asPayer = await create(f, f.alice, body(f, { targetMonth: '2026-11', payerMemberId: f.bob.memberId }));
+        assert.deepEqual(asPayer, { status: 409, body: { error: 'member_not_available', memberId: f.bob.memberId } });
+        const asTarget = await create(
+          f,
+          f.alice,
+          body(f, { targetMonth: '2026-11', split: { method: 'equal', memberIds: [f.alice.memberId, f.bob.memberId] } }),
+        );
+        assert.deepEqual(asTarget, { status: 409, body: { error: 'member_not_available', memberId: f.bob.memberId } });
+        // 脱退月（10月）の支出には、まだ選べる。
+        assert.equal((await create(f, f.alice, body(f, { targetMonth: '2026-10', payerMemberId: f.bob.memberId }))).status, 201);
+        // 脱退月が今月なら、今月分には選べる。
+        await db.prepare(`UPDATE group_members SET leave_requested_month = '2026-11' WHERE id = ?`).bind(f.bob.memberId).run();
+        assert.equal((await create(f, f.alice, body(f, { targetMonth: '2026-11', payerMemberId: f.bob.memberId }))).status, 201);
       });
 
       it('参加する前の月の支出には選べない', async () => {
@@ -470,6 +512,23 @@ describe('支出のAPI', () => {
         const result = await create(f, f.carol, body(f, { payerMemberId: f.alice.memberId }));
         assert.deepEqual(result, { status: 403, body: { error: 'forbidden' } });
         assert.equal(await expenseCount(f.groupId), 0);
+      });
+
+      it('脱退を選んだ月が終わったメンバーも、Cronの確定を待たずに、支出を記録できない（403）。脱退月のうちは記録できる', async () => {
+        const f = await createFixture();
+        const id = await register(f);
+        await db.prepare(`UPDATE group_members SET leave_requested_month = '2026-10' WHERE id = ?`).bind(f.bob.memberId).run();
+        const before = await dataVersion(f.groupId);
+        assert.deepEqual(await create(f, f.bob, body(f)), { status: 403, body: { error: 'forbidden' } });
+        assert.deepEqual(await update(f.bob, id, { amountMinor: 1 }), { status: 403, body: { error: 'forbidden' } });
+        assert.deepEqual(await remove(f.bob, id), { status: 403, body: { error: 'forbidden' } });
+        assert.equal(await dataVersion(f.groupId), before);
+        assert.equal((await expenseRow(id))!.amount_minor, 4280);
+        // グループのデータは、見られる。
+        assert.equal((await list(f, f.bob, '2026-11')).status, 200);
+        // 脱退月が今月のうちは、これまでどおり記録できる。
+        await db.prepare(`UPDATE group_members SET leave_requested_month = '2026-11' WHERE id = ?`).bind(f.bob.memberId).run();
+        assert.equal((await create(f, f.bob, body(f))).status, 201);
       });
     });
 
@@ -804,6 +863,102 @@ describe('支出のAPI', () => {
       assert.equal((await update(f.alice, id, { targetMonth: '2026-10', payerMemberId: f.alice.memberId })).status, 200);
     });
 
+    it('削除したメンバーが入った支出の負担を組み直すとき、そのメンバーの負担を増やすことはできない', async () => {
+      const f = await createFixture();
+      const id = await register(f, {
+        amountMinor: 1000,
+        split: { method: 'equal', memberIds: [f.alice.memberId, f.bob.memberId] },
+      });
+      // 登録のあとに、bob が削除されたことにする。
+      await db
+        .prepare(`UPDATE group_members SET status = 'deleted', user_id = NULL, expense_end_month = '2026-11' WHERE id = ?`)
+        .bind(f.bob.memberId)
+        .run();
+      const notAvailable = { status: 409, body: { error: 'member_not_available', memberId: f.bob.memberId } };
+
+      // 本人が異議を出せない相手に、負担を寄せ直せない（500 → 1000）。
+      assert.deepEqual(
+        await update(f.alice, id, {
+          split: {
+            method: 'fixed',
+            amounts: [
+              { memberId: f.alice.memberId, amountMinor: 0 },
+              { memberId: f.bob.memberId, amountMinor: 1000 },
+            ],
+          },
+        }),
+        notAvailable,
+      );
+      // 金額を増やして均等に割り直すと、bob の負担が増える（500 → 1000）ので同じ。
+      assert.deepEqual(
+        await update(f.alice, id, {
+          amountMinor: 2000,
+          split: { method: 'equal', memberIds: [f.alice.memberId, f.bob.memberId] },
+        }),
+        notAvailable,
+      );
+      assert.deepEqual((await allocationRows(id)).map((row) => row.burden_minor), [500, 500]);
+
+      // 画面が負担の指定ごと送り直してくる編集（負担額は変わらない）は通る。
+      assert.equal(
+        (await update(f.alice, id, {
+          description: '内容だけ直す',
+          split: { method: 'equal', memberIds: [f.alice.memberId, f.bob.memberId] },
+        })).status,
+        200,
+      );
+      // bob の負担を増やさない組み直しは通る（金額を増やした分は alice が負担する）。
+      const result = await update(f.alice, id, {
+        amountMinor: 1500,
+        split: {
+          method: 'fixed',
+          amounts: [
+            { memberId: f.alice.memberId, amountMinor: 1000 },
+            { memberId: f.bob.memberId, amountMinor: 500 },
+          ],
+        },
+      });
+      assert.equal(result.status, 200);
+      assert.deepEqual((await allocationRows(id)).map((row) => row.burden_minor), [1000, 500]);
+      // 新しく加えるメンバーは、負担が0でも、使えるメンバーでなければならない。
+      assert.deepEqual(
+        await update(f.alice, id, {
+          amountMinor: 1500,
+          split: {
+            method: 'ratio',
+            shares: [
+              { memberId: f.alice.memberId, basisPoints: 10000 },
+              { memberId: f.daveMemberId, basisPoints: 0 },
+            ],
+          },
+        }),
+        { status: 409, body: { error: 'member_not_available', memberId: f.daveMemberId } },
+      );
+      // グループに居ないメンバーは、負担を増やすかどうかに関わらず400。
+      assert.deepEqual(
+        await update(f.alice, id, {
+          amountMinor: 1500,
+          split: {
+            method: 'ratio',
+            shares: [
+              { memberId: f.alice.memberId, basisPoints: 10000 },
+              { memberId: f.other.member.memberId, basisPoints: 0 },
+            ],
+          },
+        }),
+        { status: 400, body: { error: 'invalid_request', field: 'split.shares' } },
+      );
+    });
+
+    it('アーカイブした費目の支出は、費目を変えないかぎり、別の月へも移せる（月に依らない規則は見直さない）', async () => {
+      const f = await createFixture();
+      const id = await register(f, { targetMonth: '2026-11' });
+      await db.prepare('UPDATE categories SET archived_at = ? WHERE id = ?').bind(NOW, f.categoryId).run();
+      const result = await update(f.alice, id, { targetMonth: '2026-10' });
+      assert.equal(result.status, 200);
+      assert.equal(result.body.expense.targetMonth, '2026-10');
+    });
+
     it('アーカイブした費目に変えられない。すでにアーカイブした費目の支出は、そのまま直せる', async () => {
       const f = await createFixture();
       const id = await register(f);
@@ -832,7 +987,8 @@ describe('支出のAPI', () => {
     it('入力が空・不正なら400', async () => {
       const f = await createFixture();
       const id = await register(f);
-      assert.equal((await update(f.alice, id, {})).status, 400);
+      // 項目を特定できない不備には、field を付けない。
+      assert.deepEqual(await update(f.alice, id, {}), { status: 400, body: { error: 'invalid_request' } });
       assert.equal((await update(f.alice, id, { amountMinor: -5 })).status, 400);
       assert.equal((await update(f.alice, id, { id: 'other' })).status, 400);
     });
@@ -1047,7 +1203,11 @@ describe('支出のAPI', () => {
     it('認証なしは401、知らないパスは404、許さないメソッドは405', async () => {
       const f = await createFixture();
       assert.equal((await fetchApi('GET', `/groups/${f.groupId}/expenses?month=2026-11`, null)).status, 401);
-      assert.equal((await worker.fetch(request('GET', '/nope', null), env)).status, 404);
+      const unknown = await worker.fetch(request('GET', '/nope', null), env);
+      assert.equal(unknown.status, 404);
+      // 知らないパスも、他の404と同じ形（アプリがエラーをJSONとして読めるように）。
+      assert.deepEqual(await unknown.json(), { error: 'not_found' });
+      assert.equal(unknown.headers.get('cache-control'), 'no-store');
       const put = await worker.fetch(request('PUT', `/groups/${f.groupId}/expenses`, f.alice.token), env);
       assert.equal(put.status, 405);
       assert.equal(put.headers.get('allow'), 'GET, POST');

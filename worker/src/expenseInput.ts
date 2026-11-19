@@ -37,6 +37,7 @@ export interface UpdateExpenseInput {
   split?: SplitInput;
 }
 
+/** 失敗は、直すべき項目の名前。本文全体の不備（空の本文）で項目を特定できないときは空文字。 */
 export type ParseResult<T> = { ok: true; value: T } | { ok: false; field: string };
 
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
