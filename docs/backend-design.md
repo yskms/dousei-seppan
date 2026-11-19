@@ -495,7 +495,9 @@ Webからのアカウント削除依頼（Google Play向け）の本人確認は
 | `0005_expenses.sql` | expenses / expense_allocations / recurring_expense_runs |
 | `0006_closings_settlements.sql` | monthly_closings / closing_member_summaries / closing_category_burdens / settlement_transfers |
 
-D1のローカル環境で、全マイグレーションを最初から適用できることを確認する。
+実際のファイルは `worker/migrations/` にある。ローカルのD1で、最初から全部を適用できることを `worker/test/schema.test.ts` で確かめている（テーブルの一覧、`group_id` が先頭の索引、主なCHECKと外部キー）。
+
+本番へ適用するまでは、この付録Aとマイグレーションを、両方そろえて直す。本番へ適用した後は、マイグレーションを書き換えず、次の番号を足す（付録Aは、最新の形に直す）。
 
 ---
 
@@ -590,7 +592,7 @@ D1のローカル環境で、全マイグレーションを最初から適用で
 
 # 付録A：D1用SQL DDL 初版
 
-> 注意：以下は設計を具体化するための初版DDL。まだ本番適用済み・実機検証済みではない。D1ローカル環境でマイグレーション適用、外部キー、トランザクション、削除・匿名化の挙動を確認してから採用する。実際のmigrationファイルはこの付録から分割して作成する。
+> 注意：以下のDDLは `worker/migrations/0001`〜`0006` に分けて置いてある（10章）。ローカルのD1で適用と主な制約は確かめたが、トランザクション、削除・匿名化の挙動は、APIを作るときに確かめる。
 
 共通の約束（Singfolioに揃える）：
 
