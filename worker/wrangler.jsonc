@@ -1,0 +1,30 @@
+// 同棲折半のバックエンド（Cloudflare Workers + D1）。設計は docs/backend-design.md。
+// いまはローカル（wrangler dev。D1は .wrangler/state のローカルDB）だけで使う。
+// 本番のWorker・D1・ドメインは、公開の準備のときに作り、ここに書き足す。
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "dousei-seppan",
+  "main": "src/index.ts",
+  // 上げるときは、wranglerを上げて、動きが変わらないか確かめる。
+  "compatibility_date": "2026-11-13",
+
+  // 本番の入口は、独自ドメインだけにする予定（workers.dev とプレビューのURLは出さない）。
+  "workers_dev": false,
+  "preview_urls": false,
+
+  // ログに認証の値を出さないため、Workers Logs は無効のままにする（Singfolioと同じ）。
+  "observability": {
+    "enabled": false,
+    "redact_query_string": true
+  },
+
+  // 本番のD1を作るまでは、ローカル専用。database_id は、本番のD1を作ったときにそのIDに置き換える（秘密ではない）。
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "dousei-seppan",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ]
+}
