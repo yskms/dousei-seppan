@@ -1,10 +1,11 @@
 /// <reference types="node" />
 // グループ内データの書き込みの競合制御（src/groupWrite.ts）の検査。設計は docs/backend-design.md 8章。
-// ローカルD1（miniflare）での検査なので、確かめるのはSQLと batch の振る舞い。本番D1の同時実行の
-// 性質そのものは、公開前に Workers の実環境で確認する（13章の9）。
+// ローカルD1（miniflare）での検査なので、確かめるのはSQLと batch の振る舞い（ロジック）。ローカルD1は
+// batch を直列に実行するため、並行して走ったときの性質や、本番D1のエラーの形は確かめていない。
+// それらは、公開前に Workers の実環境で確認する（docs/backend-design.md 13章の9）。
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
-import { GROUP_WRITE_GUARD, readDataVersion, writeToGroup } from '../src/groupWrite.ts';
+import { GROUP_WRITE_GUARD, isUniqueViolation, readDataVersion, writeToGroup } from '../src/groupWrite.ts';
 import { openLocalDatabase, type LocalDatabase } from './localDatabase.ts';
 
 describe('グループ単位の楽観ロック（8章）', () => {
@@ -166,7 +167,7 @@ describe('グループ単位の楽観ロック（8章）', () => {
         deleteExpense(f, token, doomed),
       ]);
 
-      assert.deepEqual(loser, { ok: false, reason: 'conflict' });
+      assert.deepEqual(loser, { ok: false, reason: 'version' });
       assert.equal(await expenseAmount(newId), null);
       assert.equal(await expenseAmount(existing), 4280);
       assert.equal(await expenseAmount(doomed), 4280);
@@ -175,25 +176,39 @@ describe('グループ単位の楽観ロック（8章）', () => {
       assert.equal(await readToken(f.groupId), winnerToken);
     });
 
-    it('同じバージョンを読んだ複数のリクエストが同時に書くと、ちょうど1つだけが成功する', async () => {
-      // 競合は一度では起きないことがあるので、何回か繰り返す。
-      for (let round = 0; round < 10; round++) {
-        const f = await addGroup();
-        const writers = 5;
-        const results = await Promise.all(
-          Array.from({ length: writers }, () => {
-            const expenseId = id('expense');
-            return writeToGroup(db, f.groupId, 0, (token) => [insertExpense(f, token, expenseId)]);
-          }),
-        );
-        const winners = results.filter((r) => r.ok);
-        assert.equal(winners.length, 1, `ラウンド${round}: 成功は1つだけ`);
-        assert.equal(results.filter((r) => !r.ok).length, writers - 1);
-        // 勝った側の支出だけが入っていて、負けた側の支出は入っていない。
-        assert.equal(await countRows('expenses', f.groupId), 1);
-        assert.equal(await readDataVersion(db, f.groupId), 1);
-        assert.equal(await readToken(f.groupId), winners[0].token);
-      }
+    it('同じバージョンを読んだ複数のリクエストが書くと、ちょうど1つだけが成功する', async () => {
+      // 5つとも、バージョン0を読んだ状態で書く。ローカルD1は batch を直列に実行するので、これは並行実行の
+      // 検査ではなく、「同じバージョンからの書き込みは1つしか通らない」というロジックの検査。
+      const f = await addGroup();
+      const writers = 5;
+      const results = await Promise.all(
+        Array.from({ length: writers }, () => {
+          const expenseId = id('expense');
+          return writeToGroup(db, f.groupId, 0, (token) => [insertExpense(f, token, expenseId)]);
+        }),
+      );
+      const winners = results.filter((r) => r.ok);
+      assert.equal(winners.length, 1);
+      assert.deepEqual(
+        results.filter((r) => !r.ok),
+        Array.from({ length: writers - 1 }, () => ({ ok: false, reason: 'version' })),
+      );
+      // 勝った側の支出だけが入っていて、負けた側の支出は入っていない。
+      assert.equal(await countRows('expenses', f.groupId), 1);
+      assert.equal(await readDataVersion(db, f.groupId), 1);
+      assert.equal(await readToken(f.groupId), winners[0].token);
+    });
+
+    it('古いバージョンなら、一意制約に違反するはずの書き込みでも、一意制約ではなくバージョンの競合になる', async () => {
+      // 後続のSQLが実行されないので、一意制約に触れない。読み直してやり直すと、そこで初めて 'unique' になる。
+      const f = await addGroup();
+      const first = await writeToGroup(db, f.groupId, 0, (token) => [insertClosing(f, token, id('closing'))]);
+      assert.ok(first.ok);
+
+      const stale = await writeToGroup(db, f.groupId, 0, (token) => [insertClosing(f, token, id('closing'))]);
+      assert.deepEqual(stale, { ok: false, reason: 'version' });
+      const reread = await writeToGroup(db, f.groupId, 1, (token) => [insertClosing(f, token, id('closing'))]);
+      assert.deepEqual(reread, { ok: false, reason: 'unique' });
     });
 
     it('簡略化した条件（data_version = v + 1）では、負けた側の後続SQLまで実行されてしまう', async () => {
@@ -239,7 +254,7 @@ describe('グループ単位の楽観ロック（8章）', () => {
       const attempt = (version: number) =>
         writeToGroup(db, f.groupId, version, (token) => [insertExpense(f, token, mine)]);
       const first = await attempt(myVersion!);
-      assert.deepEqual(first, { ok: false, reason: 'conflict' });
+      assert.deepEqual(first, { ok: false, reason: 'version' });
       assert.equal(await expenseAmount(mine), null);
 
       const reread = await readDataVersion(db, f.groupId);
@@ -251,8 +266,58 @@ describe('グループ単位の楽観ロック（8章）', () => {
     });
   });
 
+  describe('バージョンを読む順序（lost update）', () => {
+    // 支出の金額に1000円を足す、読み取り→書き込みの処理。間に、別のリクエストが金額を書き換える。
+    const raise = async (f: Fixture, expenseId: string, order: 'version-first' | 'data-first') => {
+      let version: number | null = null;
+      if (order === 'version-first') version = await readDataVersion(db, f.groupId);
+      const amount = await expenseAmount(expenseId);
+      // ここで別のリクエストが、金額を 5000 に書き換えて確定する。
+      const other = await writeToGroup(db, f.groupId, (await readDataVersion(db, f.groupId))!, (token) => [
+        updateExpense(f, token, expenseId, 5000),
+      ]);
+      assert.ok(other.ok);
+      if (order === 'data-first') version = await readDataVersion(db, f.groupId);
+      return writeToGroup(db, f.groupId, version!, (token) => [updateExpense(f, token, expenseId, amount! + 1000)]);
+    };
+
+    it('バージョンを先に読めば、間に入った別の書き込みが競合として検出される', async () => {
+      const f = await addGroup();
+      const expenseId = id('expense');
+      assert.ok((await writeToGroup(db, f.groupId, 0, (token) => [insertExpense(f, token, expenseId)])).ok);
+
+      const result = await raise(f, expenseId, 'version-first');
+      assert.deepEqual(result, { ok: false, reason: 'version' });
+      assert.equal(await expenseAmount(expenseId), 5000, '別のリクエストの更新が残る');
+    });
+
+    it('データを先に読むと、古いデータからの計算が通り、別のリクエストの更新を黙って上書きする（してはいけない順序）', async () => {
+      const f = await addGroup();
+      const expenseId = id('expense');
+      assert.ok((await writeToGroup(db, f.groupId, 0, (token) => [insertExpense(f, token, expenseId)])).ok);
+
+      const result = await raise(f, expenseId, 'data-first');
+      assert.ok(result.ok, '楽観ロックは通ってしまう');
+      assert.equal(await expenseAmount(expenseId), 4280 + 1000, '5000への更新が失われている');
+    });
+  });
+
+  describe('一意制約違反の判定（isUniqueViolation）', () => {
+    it('D1のメッセージの前置きや、cause 側にある場合も拾い、他のエラーは拾わない', () => {
+      const raw = 'UNIQUE constraint failed: monthly_closings.group_id, monthly_closings.target_month: SQLITE_CONSTRAINT';
+      assert.ok(isUniqueViolation(new Error(`D1_ERROR: ${raw}`)));
+      assert.ok(isUniqueViolation(new Error('D1_ERROR: batch failed', { cause: new Error(raw) })));
+      assert.ok(isUniqueViolation(new Error('batch failed', { cause: raw })));
+      assert.ok(!isUniqueViolation(new Error('D1_ERROR: CHECK constraint failed: amount_minor >= 1')));
+      assert.ok(!isUniqueViolation(new Error('D1_ERROR: FOREIGN KEY constraint failed')));
+      assert.ok(!isUniqueViolation(new Error('network lost', { cause: new Error('timeout') })));
+      assert.ok(!isUniqueViolation({ message: 'UNIQUE constraint failed' }), 'Error でも文字列でもないものは拾わない');
+      assert.ok(!isUniqueViolation(undefined));
+    });
+  });
+
   describe('batch の途中でエラーになるとき', () => {
-    it('一意制約違反（二重締め）は、batch 全体がロールバックされ、競合として返る', async () => {
+    it('一意制約違反（二重締め）は、batch 全体がロールバックされ、バージョンの競合とは別の理由で返る', async () => {
       const f = await addGroup();
       const first = await writeToGroup(db, f.groupId, 0, (token) => [insertClosing(f, token, id('closing'))]);
       assert.ok(first.ok);
@@ -265,7 +330,7 @@ describe('グループ単位の楽観ロック（8章）', () => {
         insertClosing(f, token, id('closing')),
       ]);
 
-      assert.deepEqual(second, { ok: false, reason: 'conflict' });
+      assert.deepEqual(second, { ok: false, reason: 'unique' });
       assert.equal(await countRows('monthly_closings', f.groupId), 1);
       assert.equal(await expenseAmount(extra), null, '同じ batch の他のSQLも取り消される');
       assert.equal(await readDataVersion(db, f.groupId), 1, 'バージョンも上がらない');
@@ -286,10 +351,10 @@ describe('グループ単位の楽観ロック（8章）', () => {
       assert.equal(await readDataVersion(db, f.groupId), 0);
     });
 
-    it('存在しないグループは競合として返る', async () => {
+    it('存在しないグループは、バージョンの競合として返る', async () => {
       const f = await addGroup();
       const result = await writeToGroup(db, 'no-such-group', 0, (token) => [insertExpense(f, token, id('expense'))]);
-      assert.deepEqual(result, { ok: false, reason: 'conflict' });
+      assert.deepEqual(result, { ok: false, reason: 'version' });
       assert.equal(await countRows('expenses', f.groupId), 0);
     });
   });
