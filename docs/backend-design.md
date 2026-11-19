@@ -597,6 +597,10 @@ D1のローカル環境で、全マイグレーションを最初から適用で
 - 日時はUnixエポックのミリ秒（INTEGER）。月は `YYYY-MM`、日付は `YYYY-MM-DD` のTEXT。
 - D1は外部キーを既定で強制するので、`PRAGMA foreign_keys` は書かない。
 - 金額の上限 `1000000000000`（2章）は、実装時に定数として1か所にまとめる。
+- グループの配下のテーブルには、すべて `group_id`（またはその親のID）が先頭にくる主キーか索引を持たせる。理由は2つ。
+  - グループの削除は `group_id` で行を消すので、索引が無いと、全グループの行を読むことになる。D1は読んだ行数で課金される。
+  - 親の行（メンバー・費目など）を消すとき、SQLiteは子のテーブルを外部キーの列で探す。子の側に、外部キーのどれかの列が先頭にくる索引が無いと、子のテーブル全体を読む。複合外部キーは `(xxx_id, group_id)` なので、`group_id` が先頭の索引があれば、そのグループの行だけを読めば済む。
+- 自由入力の文字数の上限は、DDLのCHECKにも置く（APIでも検証する）。グループ名30文字、表示名20文字、費目名20文字、支出・固定費の内容100文字。
 
 ## A-1. 認証
 
@@ -628,7 +632,7 @@ CREATE TABLE identities (
 ```sql
 CREATE TABLE expense_groups (
   id TEXT PRIMARY KEY NOT NULL,
-  name TEXT NOT NULL CHECK (name <> ''),
+  name TEXT NOT NULL CHECK (name <> '' AND length(name) <= 30),
   currency_code TEXT NOT NULL CHECK (length(currency_code) = 3 AND currency_code = upper(currency_code)),
   currency_minor_unit INTEGER NOT NULL CHECK (currency_minor_unit BETWEEN 0 AND 3),
   timezone TEXT NOT NULL,
@@ -642,7 +646,7 @@ CREATE TABLE group_members (
   group_id TEXT NOT NULL REFERENCES expense_groups (id),
   -- アカウント削除時はWorkerが匿名化とあわせてNULLにする。SET NULLは消し漏れへの保険。
   user_id TEXT REFERENCES users (id) ON DELETE SET NULL,
-  display_name TEXT NOT NULL,
+  display_name TEXT NOT NULL CHECK (display_name <> '' AND length(display_name) <= 20),
   -- メンバーのアイコンの色。アプリ側の色の一覧のキー（例: 'pink'）。
   color TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'leaving', 'left', 'deleted')),
@@ -683,7 +687,7 @@ CREATE INDEX idx_invites_group ON invites (group_id);
 CREATE TABLE categories (
   id TEXT PRIMARY KEY NOT NULL,
   group_id TEXT NOT NULL REFERENCES expense_groups (id),
-  name TEXT NOT NULL CHECK (name <> ''),
+  name TEXT NOT NULL CHECK (name <> '' AND length(name) <= 20),
   -- アプリ側のアイコン・色の一覧のキー（例: 'home', 'blue'）。知らないキーは、アプリが既定のアイコン・色で表示する。
   icon TEXT NOT NULL,
   color TEXT NOT NULL,
@@ -709,6 +713,8 @@ CREATE TABLE category_month_settings (
   CHECK ((cap_member_id IS NULL) = (cap_minor IS NULL))
 ) STRICT, WITHOUT ROWID;
 
+CREATE INDEX idx_category_month_settings_group ON category_month_settings (group_id, target_month);
+
 -- 超えた分の割合（上限額つきでなければ、月合計の割合）。category_month_settings と同じ月でまとめて書く。
 CREATE TABLE category_month_shares (
   group_id TEXT NOT NULL,
@@ -720,6 +726,8 @@ CREATE TABLE category_month_shares (
   FOREIGN KEY (category_id, group_id) REFERENCES categories (id, group_id),
   FOREIGN KEY (member_id, group_id) REFERENCES group_members (id, group_id)
 ) STRICT, WITHOUT ROWID;
+
+CREATE INDEX idx_category_month_shares_group ON category_month_shares (group_id, target_month);
 ```
 
 ## A-4. 固定費
@@ -728,7 +736,7 @@ CREATE TABLE category_month_shares (
 CREATE TABLE recurring_expenses (
   id TEXT PRIMARY KEY NOT NULL,
   group_id TEXT NOT NULL REFERENCES expense_groups (id),
-  description TEXT,
+  description TEXT CHECK (description IS NULL OR length(description) <= 100),
   amount_minor INTEGER NOT NULL CHECK (amount_minor BETWEEN 1 AND 1000000000000),
   category_id TEXT NOT NULL,
   payer_member_id TEXT NOT NULL,
@@ -767,6 +775,8 @@ CREATE TABLE recurring_expense_allocations (
     OR (share_basis_points IS NULL AND amount_minor IS NULL)
   )
 ) STRICT, WITHOUT ROWID;
+
+CREATE INDEX idx_recurring_expense_allocations_group ON recurring_expense_allocations (group_id);
 ```
 
 ## A-5. 支出・負担額
@@ -777,7 +787,7 @@ CREATE TABLE expenses (
   group_id TEXT NOT NULL REFERENCES expense_groups (id),
   expense_date TEXT NOT NULL CHECK (expense_date GLOB '[0-9][0-9][0-9][0-9]-[01][0-9]-[0-3][0-9]'),
   target_month TEXT NOT NULL CHECK (target_month GLOB '[0-9][0-9][0-9][0-9]-[01][0-9]'),
-  description TEXT,
+  description TEXT CHECK (description IS NULL OR length(description) <= 100),
   amount_minor INTEGER NOT NULL CHECK (amount_minor BETWEEN 1 AND 1000000000000),
   category_id TEXT NOT NULL,
   payer_member_id TEXT NOT NULL,
@@ -809,6 +819,8 @@ CREATE TABLE expense_allocations (
   FOREIGN KEY (member_id, group_id) REFERENCES group_members (id, group_id)
 ) STRICT, WITHOUT ROWID;
 
+CREATE INDEX idx_expense_allocations_group ON expense_allocations (group_id);
+
 -- 固定費をどの月に作ったか。作った支出が消されても行は残し、作り直さない（7章）。
 -- expense_id は、支出が消されうるため外部キーにしない。
 CREATE TABLE recurring_expense_runs (
@@ -821,6 +833,8 @@ CREATE TABLE recurring_expense_runs (
   PRIMARY KEY (recurring_expense_id, scheduled_month),
   FOREIGN KEY (recurring_expense_id, group_id) REFERENCES recurring_expenses (id, group_id)
 ) STRICT, WITHOUT ROWID;
+
+CREATE INDEX idx_recurring_expense_runs_group ON recurring_expense_runs (group_id);
 ```
 
 ## A-6. 月締め・精算
@@ -831,7 +845,7 @@ CREATE TABLE monthly_closings (
   group_id TEXT NOT NULL REFERENCES expense_groups (id),
   target_month TEXT NOT NULL CHECK (target_month GLOB '[0-9][0-9][0-9][0-9]-[01][0-9]'),
   currency_code TEXT NOT NULL,
-  currency_minor_unit INTEGER NOT NULL,
+  currency_minor_unit INTEGER NOT NULL CHECK (currency_minor_unit BETWEEN 0 AND 3),
   data_version INTEGER NOT NULL,
   closed_by_member_id TEXT NOT NULL,
   closed_at INTEGER NOT NULL,
@@ -857,7 +871,11 @@ CREATE TABLE closing_member_summaries (
   CHECK (net_minor = difference_minor + carried_in_minor)
 ) STRICT, WITHOUT ROWID;
 
--- total_minor は、その費目の支出の合計（個別設定の支出を含む）。burden_minor はそのメンバーの負担額。
+CREATE INDEX idx_closing_member_summaries_group ON closing_member_summaries (group_id);
+
+-- total_minor は、その費目の支出の合計（個別設定の支出を含む）。
+-- burden_minor は、その費目でのそのメンバーの負担額（費目の割合による分と、個別設定の支出の分の合計）。
+-- 費目ごとに、全メンバーの burden_minor の合計は total_minor と一致する。
 CREATE TABLE closing_category_burdens (
   group_id TEXT NOT NULL,
   closing_id TEXT NOT NULL,
@@ -870,6 +888,8 @@ CREATE TABLE closing_category_burdens (
   FOREIGN KEY (category_id, group_id) REFERENCES categories (id, group_id),
   FOREIGN KEY (member_id, group_id) REFERENCES group_members (id, group_id)
 ) STRICT, WITHOUT ROWID;
+
+CREATE INDEX idx_closing_category_burdens_group ON closing_category_burdens (group_id);
 
 CREATE TABLE settlement_transfers (
   id TEXT PRIMARY KEY NOT NULL,
@@ -894,6 +914,9 @@ CREATE TABLE settlement_transfers (
   ),
   UNIQUE (closing_id, from_member_id, to_member_id)
 ) STRICT, WITHOUT ROWID;
+
+-- 翌月の締めで、前の月の締めの carried の送金を読むときにも使う。
+CREATE INDEX idx_settlement_transfers_group ON settlement_transfers (group_id, closing_id);
 ```
 
 ## A-7. DDLだけでは保証できないこと
@@ -908,5 +931,6 @@ CREATE TABLE settlement_transfers (
 - 月締め後に、対象月の支出・負担割合を変更できないこと。
 - 送金の状態が `pending` からしか変わらないこと（UPDATEに `AND status = 'pending'` を付ける）。
 - グループ通貨が支出登録後に変更されないこと。
+- 費目ごとの `closing_category_burdens.burden_minor` の合計が `total_minor` と一致すること。
 - 匿名化時に `group_members.display_name` と `closing_member_summaries.display_name_snapshot` の両方を更新すること。
 - `users` の削除前に、メンバー行の匿名化と `user_id` の解除を済ませること。
