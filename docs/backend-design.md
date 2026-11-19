@@ -178,7 +178,10 @@ Workerで次をすべて確認してから締める。
 - 対象月が、カレンダー上の今月以前（グループのタイムゾーン）。月の途中でも締められるが、まだ始まっていない月は締められない。
 - 対象月がまだ締められていない。
 - 前の月が締め済みで、その送金がすべて `settled` または `carried`。グループで最初の月（最初の支出がある月、または作成月）はこの条件を問わない。
-- 操作者が、その月に有効なメンバー。
+  - 「最初の月」は、締めがまだ1つも無いときの、最初の支出がある月以前の月（支出が1件も無ければ作成月以前）。作成月に支出が無く、翌月に最初の支出を登録したグループは、作成月を締めずに、翌月を最初に締められる。それより前の月に支出を登録すれば、そちらが最初の月になる。
+  - 締めが1つでもあるとき、前の月が未締めなら締められない。飛ばした月も、古い月から順に締める。
+  - 最後に締めた月以前の月は、締めていなくても締められない（`month_closed`）。古い月を後から締めると、翌月の締めに繰越を足す前提が崩れるため。
+- 操作者が、その月に有効なメンバー（参加（復帰）した月から、脱退月まで。5章）。
 
 ### 月締めの処理
 
@@ -191,6 +194,7 @@ Workerで次をすべて確認してから締める。
    - `closing_member_summaries`
    - `closing_category_burdens`（費目ごとの合計と、メンバーごとの負担額。履歴画面の内訳用）
    - `settlement_transfers`
+   - 脱退が確定した（`leaving`）メンバーのうち、脱退月が締められ、関わる未処理の送金が無いメンバーを `left` にする（5章の4。送金が0件なら、ここで脱退済みになる）
 
 月締め後は、API側で対象月への支出の追加・編集・削除と、割合の変更を拒否する。UIだけで制限しない。
 
@@ -410,7 +414,7 @@ D1には対話的トランザクションがなく、`batch()` 単位でのみ�
 
 **注意（読む順序）：** バージョンは、計算に使うデータより**先に**読む。データを先に読み、あとでバージョンを読むと、その間に入った別の書き込みの新しいバージョンと、古いデータを組み合わせてしまう。楽観ロックは通るので、別のリクエストの更新を黙って上書きする（lost update）。バージョンを先に読めば、間に入った書き込みはバージョンの不一致として検出される。検証用のデータの読み取りを増やすときも、この順序を崩さない。
 
-実装は `worker/src/groupWrite.ts` の `writeToGroup`（後続SQLの条件は `GROUP_WRITE_GUARD`）。1つのグループへの書き込みは、必ずこれを通す（複数のグループにまたがるアカウント削除は、12章の未決事項）。検査は `worker/test/groupWrite.test.ts`（ローカルD1）で、次を確かめてある。
+実装は `worker/src/groupWrite.ts` の `writeToGroup`（後続SQLの条件は `GROUP_WRITE_GUARD`）。1つのグループへの書き込みは、必ずこれを通す（複数のグループにまたがるアカウント削除は、12章の未決事項）。行数が多い書き込み（月締め）は、同じ条件つきで複数行を1文にまとめる `insertRowsGuarded` を使う（D1は batch の1文を1クエリと数え、Freeは1回の呼び出しにつき50までのため。1文に束縛できる値は100まで）。検査は `worker/test/groupWrite.test.ts`（ローカルD1）で、次を確かめてある。
 
 - 古いバージョンで書くと、後続のINSERT・UPDATE・DELETEは何も変更しない。同じバージョンを読んだ複数のリクエストが書くと、成功するのは1つだけ。
 - 「`data_version = v + 1`」の簡略形では、負けた側の後続SQLまで実行される（上の注意の実例。テストに入っている）。
@@ -562,13 +566,72 @@ Webからのアカウント削除依頼（Google Play向け）の本人確認は
 
 ### 月締め・精算
 
-| API | 役割 |
-|---|---|
-| `GET /groups/:id/months/:month/summary` | 月次集計（前月からの繰越を足した精算の見込みを含む） |
-| `POST /groups/:id/months/:month/close` | 月締め |
-| `GET /groups/:id/months/:month/closing` | 締め結果 |
-| `POST /transfers/:id/settle` | 精算済みにする |
-| `POST /transfers/:id/carry` | 次月に繰り越す |
+#### 月締め・精算API（実装済み）
+
+実装は `worker/src/closings.ts`（月次集計・月締め・締め結果）と `worker/src/transfers.ts`（精算・繰越）。集計の読み込みと計算は `worker/src/monthState.ts` の `loadMonthState` と `computeMonthFromState` にだけ置き、締める前の見込み（summary）と月締めで同じものを使う（締めた結果が、直前の見込みとずれないように）。アプリとは、コードを共有せず、この節を正として両側に書く。認証・エラーの形・金額と月の形式は、支出APIの「共通」と同じ。`:month` が `YYYY-MM` でなければ404。
+
+| API | 本文 | 成功 |
+|---|---|---|
+| `GET /groups/:id/months/:month/summary` | なし | 200 `MonthView`。締める前の月は現在の支出から計算した見込み（前の月からの繰越を足す）、締めた月は締めた時点の結果 |
+| `POST /groups/:id/months/:month/close` | なし | 201 `MonthView`（締めた結果。`close` は付かない） |
+| `GET /groups/:id/months/:month/closing` | なし | 200 `MonthView`（締めた月だけ。`close` は付かない） |
+| `POST /transfers/:id/settle` | なし | 200 `{ transfer }`（精算済みにする） |
+| `POST /transfers/:id/carry` | なし | 200 `{ transfer }`（次の月に繰り越す） |
+
+`MonthView`（締めた月）：
+
+```json
+{
+  "month": "2026-10", "closed": true,
+  "closing": { "id": "…", "closedAt": 1790000000000, "closedByMemberId": "…", "processed": false },
+  "totalMinor": 14000,
+  "members": [{ "memberId": "…", "displayName": "…", "paidMinor": 10000, "burdenMinor": 7000,
+                "differenceMinor": 3000, "carriedInMinor": 0, "netMinor": 3000 }],
+  "categories": [{ "categoryId": "…", "totalMinor": 14000,
+                   "burdens": [{ "memberId": "…", "burdenMinor": 7000 }] }],
+  "transfers": [{ "id": "…", "fromMemberId": "…", "toMemberId": "…", "amountMinor": 3000,
+                  "status": "pending", "settledAt": null, "carriedAt": null,
+                  "processedByMemberId": null, "canCarry": true }],
+  "close": { "closable": false, "reason": "month_closed" }
+}
+```
+
+- `totalMinor` はその月の支出の総額で、繰越を含めない。`members[].burdenMinor` と `categories` の負担額にも繰越は入らない。繰越は `carriedInMinor`（送金先なら足し、送金元なら引く）と `netMinor`（精算する額 = 差額 + 繰越）にだけ入る（3章・4章）。
+- `members` は固定のメンバー順（IDの昇順）。その月に参加している全員（参加月から脱退月まで。削除したユーザーも、削除した月まで）と、支出・費目の割合・繰越に出てくる全員が並ぶ。支出に関わらなくても0で出る。`displayName` は、締めた月では締めた時点の名前。
+- `categories` は、支出がある費目だけ（`categoryId` の昇順）。`totalMinor` は個別設定の支出を含む合計、`burdens` は費目の割合による分と個別設定の分の合計で、負担額が0のメンバーの行は無いことがある。
+- 締める前の月（`closed: false`）は、`closing` が `null`、`transfers` が見込み（`{ fromMemberId, toMemberId, amountMinor }` だけ。IDも状態も無い。締めるまで確定しない）。締めた月の `transfers` は、送金ごとに状態つき。
+- `processed`：すべての送金が `settled` か `carried`（送金が0件の月も true。4章）。
+- `canCarry`：未処理で、送金元・送金先がどちらも繰り越せるメンバー（`active` で `leave_requested_month` なし）のときだけ true。アプリが規則を持たなくて済むように返す。
+- `close`（summary だけ）：その月を、いま操作しているメンバーが締められるか。締められれば `{ "closable": true }`、締められなければ `{ "closable": false, "reason": "…" }`。`reason` は、月締めの409・403のエラー名と同じ（下の表）で、`previous_month_not_closed`・`previous_month_unsettled` には `month`（先に済ませる月）が付く。まだ締められない月の見込みも、同じ形で返す（アプリが「先に10月を締めてください」を出せるように）。
+- まだ始まっていない月も、summary は返す（集計は空に近く、`close.reason` は `month_not_started`）。
+
+月締めの書き込み（4章）は、1回の `writeToGroup`（8章）。**やり直さず**、競合したら409 `conflict`（確認ダイアログの内容が変わりうるため。アプリは読み直して案内する）。二重締めの同時実行は、片方だけが締まり、もう片方は409 `conflict`（すでに締められたあとなら `month_closed`）。D1のクエリ数は、費目・メンバーの数によらず約25（認証を含む。実測。複数行INSERTにまとめているため）。
+
+精算・繰越（4章）：
+
+- 状態は `pending → settled`、`pending → carried` だけ。確定後に戻せない（409 `transfer_not_pending`、`status` に今の状態を添える）。`UPDATE` にも `AND status = 'pending'` を付けている。
+- 全メンバー（`active`・`leaving`）が、当事者でない送金も操作できる。ただし、送金のある月を見られるメンバー（参加前の月の送金は404）。
+- 繰越は、送金元・送金先に、脱退を選んだ（`leave_requested_month` あり）・`leaving`・`left`・`deleted` のメンバーがいると、409 `transfer_not_carryable`。精算済みにはできる。
+- 精算済みにした結果、脱退が確定した（`leaving`）メンバーの未処理の送金が無くなり、脱退月が締められていれば、そのメンバーを `left` にする（5章の4。同じ `batch` の中）。
+- 精算・繰越も、やり直さずに409 `conflict`。応答の `transfer` は、更新後の送金（`canCarry` は false）。
+
+エラー：
+
+| 状態 | `error` | 意味 |
+|---|---|---|
+| 401 | `unauthorized` | セッションが無い・無効・期限切れ |
+| 403 | `forbidden` | 参加前の月の summary・closing。月締めで、操作者がその月のメンバーでない（参加前の月、脱退月が終わった月） |
+| 404 | `not_found` | グループ・送金が無い、メンバーでない、脱退済み・削除済み、他のグループのID、参加前の月の送金。区別しない（IDの存在を教えない） |
+| 404 | `not_closed` | closing：まだ締めていない月 |
+| 409 | `month_not_started` | 月締め：まだ始まっていない月（グループのタイムゾーンで、今月より後） |
+| 409 | `month_closed` | 月締め：すでに締められている、または最後に締めた月より前（4章） |
+| 409 | `previous_month_not_closed` | 月締め：前の月が未締め。`{ month }` に先に締める月を添える |
+| 409 | `previous_month_unsettled` | 月締め：前の月の送金に未処理が残っている。`{ month }` を添える |
+| 409 | `transfer_not_pending` | 精算・繰越：すでに処理済み。`{ status }` を添える |
+| 409 | `transfer_not_carryable` | 繰越：脱退予定・削除したユーザーなどが関わる送金 |
+| 409 | `conflict` | 他のリクエストの書き込みと競合した（8章）。読み直してもらう |
+
+費目の設定が無い費目の `category` の支出が月にあると、集計できずに500になる（費目を作るときに、必ず月の設定と割合を書く。付録A-7）。
 
 全APIで、認証・グループ所属・対象データのグループ一致・月の閲覧範囲・締め状態をWorker側で検証する。IDを知っているだけで他グループのデータにアクセスできないようにする。これらの判定は共通の関数にまとめる。Premiumの閲覧期間の制限（企画メモ10章）を導入するときも、同じ関数に足す。
 
@@ -670,6 +733,8 @@ Webからのアカウント削除依頼（Google Play向け）の本人確認は
 - **支出の二重送信。** 通信が途切れてアプリが同じ登録を再送すると、支出が2件できる。Workerの内部のやり直し（8章）は、書き込みが取り消されたあとなので安全。アプリが作るID（冪等キー）を受け取って、同じIDの再送を同じ結果として返す案がある。13章の8（二重登録の統合テスト）の前に決める。
 - **ログイン・ログアウトのAPIが13章の順に無い。** 支出のAPIのために、認証のうちセッションの確認（`worker/src/session.ts` の `authenticateSession`）だけをSingfolioからコピーした。ログイン（`/auth/nonce`・`/auth/login`・AndroidのApple）、ログアウト、アカウント削除は未実装。アプリから呼べるようにするまでに、同じ元から取り込む。
 
+- **ホームの月ピッカーの状態の印（未締め / 精算が残っている / 処理済み。screens.md 2章）を返すAPIが無い。** 9章の月締め・精算APIは1か月ずつ。グループ・メンバーのAPI（9章）を決めるときに、月の一覧（月ごとの締め・未処理の送金の有無）を返すAPIを足す。
+
 （以前の確認事項は、固定費の月末日を7章、匿名化の範囲を5章、対応通貨を2章で決めた）
 
 ---
@@ -681,11 +746,13 @@ Webからのアカウント削除依頼（Google Play向け）の本人確認は
 3. 負担額・精算額の計算関数を、DB非依存のTypeScriptとして実装・テストする。
 4. 8章の競合制御を、ローカルD1で小さく検証する。
 5. 支出CRUD APIを実装する。（実装済み。仕様は9章の「支出API」。費目・メンバー・グループを作るAPIはまだ無いので、テストはSQLで用意している）
-6. 月締め・精算・繰越APIを実装する。
-7. 招待・参加・脱退・匿名化APIと、Cronの処理を実装する。
+6. 月締め・精算・繰越APIを実装する。（実装済み。仕様は9章の「月締め・精算API」。テストは SQL で準備した月・支出・費目の割合に対して行っている）
+7. 招待・参加・脱退・匿名化APIと、Cronの処理を実装する。月締めのbatch（`worker/src/closings.ts`）には、脱退の確定（5章の2。脱退月を締めたとき）をまだ入れていない。脱退を確定する処理は Cron と共通にして、月締めのbatchにも足す（脱退済みへの遷移だけは、月締めと精算に入れてある）。
 8. 競合・権限・二重登録の統合テストを実施する。
 9. Workers FreeでCPU時間・D1クエリ数を確認し、公開前にPaidへ移行するか判断する。あわせて、本番D1で次を確認する（ローカルD1では確かめられないもの）。
    - 8章の競合制御が、並行して走るリクエストでも、成功を1つに絞ること。
+   - 複数行INSERT（`insertRowsGuarded`、`VALUES` を副問い合わせにした `INSERT ... SELECT`）が、本番D1でも通ること。1文に束縛できる値は100までとして分けている。
+   - 月締めのD1クエリ数（実測で約25。ローカルD1での数）が、Freeの上限（1回の呼び出しにつき50）に収まること。
    - 一意制約違反のエラーの形が、`isUniqueViolation`（`worker/src/groupWrite.ts`）の判定に合うこと。外れると、`'unique'` が例外（500）に変わる。
 
 **この文書は設計方針のまとめであり、SQLはまだ本番投入用の確定版ではない。** 次工程では、実際のマイグレーションを作りながらSQLite/D1で制約とトランザクションを検証する。
