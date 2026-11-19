@@ -92,6 +92,47 @@ export async function writeToGroup(
   return { ok: true, token, results: results.slice(1) };
 }
 
+/** `writeToGroupWithRetry` の `plan` の結果。書くか、書かずに断るか。 */
+export type GroupWritePlan<T, R> =
+  /** 書く。`write` は writeToGroup の build と同じ（各SQLに GROUP_WRITE_GUARD を付ける）。`value` は成功時にそのまま返す。 */
+  | { write: (token: string) => D1PreparedStatement[]; value: T }
+  /** 書かずに断る（検証に通らなかった、など）。`reject` はそのまま返す。 */
+  | { reject: R };
+
+export type GroupWriteOutcome<T, R> =
+  | { status: 'written'; value: T }
+  | { status: 'rejected'; reject: R }
+  /** グループが無い（バージョンを読めなかった）。 */
+  | { status: 'no_group' }
+  /** やり直しても競合した（'version'）、または一意制約に違反した（'unique'。やり直さない）。何も変更されていない。 */
+  | { status: 'conflict'; reason: 'version' | 'unique' };
+
+/**
+ * 「読み直して1回だけやり直す」書き込み（支出の登録・編集・削除、割合の変更など。docs/backend-design.md 8章
+ * 「競合したとき」）。やり直さずに409にする操作（月締め・精算・繰越・参加・脱退）は、writeToGroup を直接使う。
+ *
+ * 試行ごとに、バージョンを読み、その**あとで** `plan` が検証用のデータを読んで、書くSQLを組み立てる
+ * （ファイル冒頭の注意1。`plan` の中で読むデータは、必ず渡されたバージョンのあとに読む）。
+ * 'version' はやり直す（`maxAttempts` 回まで）。'unique' は読み直しても同じ結果なので、やり直さない。
+ */
+export async function writeToGroupWithRetry<T, R>(
+  db: D1Database,
+  groupId: string,
+  plan: (version: number) => Promise<GroupWritePlan<T, R>>,
+  maxAttempts = 2,
+): Promise<GroupWriteOutcome<T, R>> {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const version = await readDataVersion(db, groupId);
+    if (version === null) return { status: 'no_group' };
+    const planned = await plan(version);
+    if ('reject' in planned) return { status: 'rejected', reject: planned.reject };
+    const result = await writeToGroup(db, groupId, version, planned.write);
+    if (result.ok) return { status: 'written', value: planned.value };
+    if (result.reason === 'unique') return { status: 'conflict', reason: 'unique' };
+  }
+  return { status: 'conflict', reason: 'version' };
+}
+
 /**
  * 一意制約違反（主キーの重複を含む）かどうか。判定はエラーのメッセージ頼み。
  *
