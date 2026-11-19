@@ -643,6 +643,8 @@ CREATE TABLE group_members (
   -- アカウント削除時はWorkerが匿名化とあわせてNULLにする。SET NULLは消し漏れへの保険。
   user_id TEXT REFERENCES users (id) ON DELETE SET NULL,
   display_name TEXT NOT NULL,
+  -- メンバーのアイコンの色。アプリ側の色の一覧のキー（例: 'pink'）。
+  color TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'leaving', 'left', 'deleted')),
   history_from_month TEXT NOT NULL CHECK (history_from_month GLOB '[0-9][0-9][0-9][0-9]-[01][0-9]'),
   leave_requested_month TEXT CHECK (leave_requested_month GLOB '[0-9][0-9][0-9][0-9]-[01][0-9]'),
@@ -682,6 +684,9 @@ CREATE TABLE categories (
   id TEXT PRIMARY KEY NOT NULL,
   group_id TEXT NOT NULL REFERENCES expense_groups (id),
   name TEXT NOT NULL CHECK (name <> ''),
+  -- アプリ側のアイコン・色の一覧のキー（例: 'home', 'blue'）。知らないキーは、アプリが既定のアイコン・色で表示する。
+  icon TEXT NOT NULL,
+  color TEXT NOT NULL,
   sort_order INTEGER NOT NULL DEFAULT 0,
   archived_at INTEGER,
   created_at INTEGER NOT NULL,
