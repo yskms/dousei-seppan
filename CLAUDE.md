@@ -8,7 +8,7 @@
 
 ## 構成
 
-- アプリ名は「わりかん生活」（旧名「同棲折半」）。識別子（`slug`・`scheme`・Workerの名前・D1のデータベース名・npmのパッケージ名）は、そのローマ字の `warikan-seikatsu`。bundle ID・`package` は `com.yskms.warikanseikatsu` で、公開後は変えられない（`src/appConfig.test.ts`）。リポジトリ名・フォルダ名の改名は別作業で、済むまでは旧名の `dousei-seppan`。
+- アプリ名は「わりかん生活」（旧名「同棲折半」）。識別子（`slug`・`scheme`・Workerの名前・D1のデータベース名・npmのパッケージ名・GitHubのリポジトリ名・フォルダ名）は、そのローマ字の `warikan-seikatsu`。bundle ID・`package` は `com.yskms.warikanseikatsu` で、公開後は変えられない（`src/appConfig.test.ts`）。
 - リポジトリのルートがExpoアプリ（Expo Router）。`app/` は画面（ルート）のディレクトリで、アプリ全体のフォルダではない。
 - `worker/` は、Cloudflare Workers + D1 のバックエンド。自前の `package.json`・ロックファイル・tsconfigを持つ独立したパッケージ。
 - `src/` はNodeのテスト（`npm test`）から直接実行するため、画面（RN・Expoのimport）を置かない。
