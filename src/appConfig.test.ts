@@ -7,6 +7,6 @@ import { test } from 'node:test';
 const appJson = JSON.parse(readFileSync(new URL('../app.json', import.meta.url), 'utf8'));
 
 test('iOSのbundleIdentifierとAndroidのpackageが同じ', () => {
-  assert.equal(appJson.expo.ios.bundleIdentifier, 'com.yskms.douseiseppan');
+  assert.equal(appJson.expo.ios.bundleIdentifier, 'com.yskms.warikanseikatsu');
   assert.equal(appJson.expo.android.package, appJson.expo.ios.bundleIdentifier);
 });

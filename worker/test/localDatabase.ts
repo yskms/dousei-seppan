@@ -18,7 +18,7 @@ export interface LocalDatabase {
 }
 
 export async function openLocalDatabase(): Promise<LocalDatabase> {
-  const stateDir = mkdtempSync(path.join(tmpdir(), 'dousei-seppan-d1-'));
+  const stateDir = mkdtempSync(path.join(tmpdir(), 'warikan-seikatsu-d1-'));
   const wrangler = path.join(workerDir, 'node_modules', '.bin', 'wrangler');
   execFileSync(wrangler, ['d1', 'migrations', 'apply', 'DB', '--local', '--persist-to', stateDir], {
     cwd: workerDir,
