@@ -4,7 +4,7 @@ import { StyleSheet, Text, View } from 'react-native';
 export default function Index() {
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>同棲折半</Text>
+      <Text style={styles.title}>わりかん生活</Text>
     </View>
   );
 }

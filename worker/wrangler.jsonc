@@ -1,4 +1,4 @@
-// 同棲折半のバックエンド（Cloudflare Workers + D1）。設計は docs/backend-design.md。
+// わりかん生活のバックエンド（Cloudflare Workers + D1）。設計は docs/backend-design.md。
 // いまはローカル（wrangler dev。D1は .wrangler/state のローカルDB）だけで使う。
 // 本番のWorker・D1・ドメインは、公開の準備のときに作り、ここに書き足す。
 {

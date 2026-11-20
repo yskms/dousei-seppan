@@ -1,4 +1,4 @@
-# 同棲折半
+# わりかん生活
 
 同棲カップル・夫婦などの共同生活費を記録し、カテゴリごとの負担割合で月ごとに精算するアプリ（iOS / Android）。
 
@@ -8,6 +8,7 @@
 
 ## 構成
 
+- アプリの表示名（`app.json` の `name`、画面、docs）だけを「わりかん生活」に変えた（旧名「同棲折半」）。識別子は旧名のまま: リポジトリ名・`slug`・`scheme`・Workerの名前とD1のデータベース名は `dousei-seppan`、bundle ID・`package` は `com.yskms.douseiseppan`。識別子を変えるかは未決で、bundle ID・`package` は公開後に変えられない（`src/appConfig.test.ts`）。識別子を表示名に「そろえて」勝手に改名しない。
 - リポジトリのルートがExpoアプリ（Expo Router）。`app/` は画面（ルート）のディレクトリで、アプリ全体のフォルダではない。
 - `worker/` は、Cloudflare Workers + D1 のバックエンド。自前の `package.json`・ロックファイル・tsconfigを持つ独立したパッケージ。
 - `src/` はNodeのテスト（`npm test`）から直接実行するため、画面（RN・Expoのimport）を置かない。
