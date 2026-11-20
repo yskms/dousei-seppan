@@ -261,11 +261,14 @@ export async function handleGetInvite(request: Request, env: Env, now: number, t
   }
 
   if (!isUsable(invite, now)) return inviteUnavailable();
+  // 満員なら、表示名を入力させる前に知らせる(参加は 409 `group_full`。人数の数え方は参加と同じ)。
+  const members = await loadMembers(db, invite.group_id);
   return json({
     alreadyMember: false,
     groupName: invite.group_name,
     invitedByDisplayName: invite.inviter_name,
     expiresAt: invite.expires_at,
+    groupFull: countSeatedMembers(members, invite.timezone, now) >= MAX_MEMBERS_PER_GROUP,
   });
 }
 

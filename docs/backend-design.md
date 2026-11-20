@@ -245,7 +245,7 @@ Workerで次をすべて確認してから締める。
 - 招待トークンは平文で保存せず、ハッシュを保存する。招待はワンタイム、期限は3日。
 - 参加処理はグループへの書き込みとして `data_version` を上げる（8章）。同じ招待で同時に参加しようとしても、片方は409になる。
 - 新規メンバーの `history_from_month` は参加月とする。
-- **1つのグループの人数は5人まで**（`MAX_MEMBERS_PER_GROUP`。`worker/src/limits.ts`）。同棲・夫婦の2人が基本で、ルームシェアの3〜4人までを想定する。月締め・固定費の自動登録のD1のクエリ数と、精算の送金の件数が人数で増えるので、使い道の無い大人数のために、Freeの上限に余裕を残す。数えるのは、今月以降もグループにいる人（`countSeatedMembers`。`worker/src/membership.ts`）。脱退が確定した人（`leaving` 以降）と、脱退月が終わった人（Cronの確定の前でも。`isLeaveEffectiveFor`）は数えないので、入れ替わりの参加をふさがない。脱退を選んだだけで脱退月がまだ終わっていない人は、今月はいるので数える。上限なら、招待の発行も参加（`left` の人の復帰を含む）も、409 `group_full` で断る。
+- **1つのグループの人数は5人まで**（`MAX_MEMBERS_PER_GROUP`。`worker/src/limits.ts`）。同棲・夫婦の2人が基本で、ルームシェアの3〜4人までを想定する。月締め・固定費の自動登録のD1のクエリ数と、精算の送金の件数が人数で増えるので、使い道の無い大人数のために、Freeの上限に余裕を残す。数えるのは、今月以降もグループにいる人（`countSeatedMembers`。`worker/src/membership.ts`）。脱退が確定した人（`leaving` 以降）と、脱退月が終わった人（Cronの確定の前でも。`isLeaveEffectiveFor`）は数えないので、入れ替わりの参加をふさがない。脱退を選んだだけで脱退月がまだ終わっていない人は、今月はいるので数える。上限なら、招待の発行も参加（`left` の人の復帰を含む）も、409 `group_full` で断る。**アプリは満員の判定を書き写さない**（脱退月が終わった直後でCronの確定の前、などでずれる）。グループ情報の `canInvite`（招待を発行できるか）と、招待内容の確認の `groupFull`（参加すると満員で断られるか）で知る（9章）。
 - 参加月の全費目の割合を、新しいメンバーを含めた均等にリセットし、見直しのアラートを出す。参加月より後の月に割合の行があれば、それも、その月に参加しているメンバーでの均等に直す（行は、その月以前で最も新しい行の引き継ぎを上書きするので、残すと、新しいメンバーが、その月の割合に入らず、負担が0のまま続く）。後の月の行は、システムが書いたもの（アカウント削除・脱退の確定が、未締めの翌月に書いた均等の割合）のほか、手で直された割合・上限額も、メンバーの増減で戻る（企画メモの「メンバーが増減したとき、均等にリセットする」「確定した月から」に合わせた）。手で先の月に入れた設定が戻ることは、お知らせで伝える（12章）。
 - `category` 以外の負担方法の固定費は、自動登録を止め（`paused_reason = 'member_changed'`）、アラートを出す。
 - 一度脱退した人（`left`）が再参加する場合は、元のメンバー行を `active` に戻す。`history_from_month` は復帰した月にし、`leave_requested_month`・`expense_end_month`・`left_at` を消す。
@@ -532,14 +532,14 @@ Webからのアカウント削除依頼（Google Play向け）の本人確認は
 | `POST /groups/:id/invites` | なし | 201 `{ invite: { id, token, expiresAt, createdAt } }`。`token`（平文）は、この応答でだけ返す |
 | `GET /groups/:id/invites` | なし | 200 `{ invites: [{ id, expiresAt, createdAt }] }`（自分が発行した、未使用で期限内のもの） |
 | `DELETE /invites/:id` | なし | 204（発行した人だけ。すでに取り消し済みでも204） |
-| `GET /invites/:token` | なし | 200 `{ alreadyMember: false, groupName, invitedByDisplayName, expiresAt }`。すでに参加中なら 200 `{ alreadyMember: true, groupId }` |
+| `GET /invites/:token` | なし | 200 `{ alreadyMember: false, groupName, invitedByDisplayName, expiresAt, groupFull }`。すでに参加中なら 200 `{ alreadyMember: true, groupId }` |
 | `POST /invites/:token/join` | `{ "displayName": "…" }` | 201 `{ groupId, memberId }` |
 | `POST /groups/:id/leave` | なし | 200 `{ leaveRequestedMonth, confirmed }`。最後の1人の脱退が確定したときは、`groupDeleted: true` も付く |
 | `DELETE /groups/:id/leave` | なし | 200 `{ leaveRequestedMonth: null }` |
 
 - 招待トークンは、256ビットの乱数（base64url の43字）。D1にはSHA-256のハッシュだけを置く。期限は発行から3日、使い捨て。`/invites/:x` は、GET が招待トークン、DELETE が招待のID。形が違えば404。
 - 発行できるのは、脱退が確定していない参加中のメンバー（`leaving` 以降と、脱退月が終わったメンバーは403）。1人が持てる、未使用で期限内の招待は10件まで（409 `too_many_invites`）。グループの人数が上限（5人。5章の「参加」）なら、発行できない（409 `group_full`）。
-- 確認（GET）は、URLを開いただけでは何も変えない。使えない招待（知らないトークン・期限切れ・使用済み・取り消し済み・発行者が抜けた）は、理由を区別せず404 `invite_unavailable`。すでにそのグループに参加中なら、招待の状態によらず `alreadyMember: true`。
+- 確認（GET）は、URLを開いただけでは何も変えない。使えない招待（知らないトークン・期限切れ・使用済み・取り消し済み・発行者が抜けた）は、理由を区別せず404 `invite_unavailable`。すでにそのグループに参加中なら、招待の状態によらず `alreadyMember: true`。`groupFull` は、グループの人数が上限で、いま参加すると 409 `group_full` になるか（5章の「参加」と同じ数え方）。満員でも招待は有効なので、404にはしない。アプリは、表示名を入力させる前に「満員です」と出せる。
 - 参加（POST）: 人数が上限（発行のあとに、ほかの招待で埋まった）なら409 `group_full`（`left` の人の復帰も同じ）。表示名は必須（前後の空白を落として1〜20文字。コードポイントで数える）。色はサーバーが選ぶ（他の参加中のメンバーと重ならない最初の色。色は10あり、人数の上限の下では使い切らない。関数としては、全色が使われていれば、使われている数で一巡する）。色のキーは、仮の一覧 `pink, red, orange, yellow, green, teal, blue, purple, brown, gray`（`worker/src/membership.ts` の `MEMBER_COLORS`。アプリの色の一覧と揃える）。参加の中身は5章。
 - 参加・脱退を選ぶ・取り消すは、やり直さずに409 `conflict`（同じ招待で同時に参加すると、片方だけが参加し、もう片方は409）。招待の発行・取り消しは、読み直して1回だけやり直す（8章）。
 - 脱退を選ぶ: `leaveRequestedMonth` は、グループのタイムゾーンの今月。脱退月がすでに締められていれば、その場で確定する（`confirmed: true`。5章）。
@@ -579,12 +579,13 @@ Webからのアカウント削除依頼（Google Play向け）の本人確認は
   "id": "…", "name": "ふたりの生活費", "currencyCode": "JPY", "currencyMinorUnit": 0,
   "timezone": "Asia/Tokyo", "createdAt": 1790000000000,
   "memberId": "…", "currencyLocked": false,
+  "seatedMembers": 2, "maxMembers": 5, "canInvite": true,
   "members": [{ "id": "…", "displayName": "…", "color": "pink", "status": "active",
                 "historyFromMonth": "2026-11", "leaveRequestedMonth": null, "expenseEndMonth": null, "isMe": true }]
 }
 ```
 
-- `members` は、脱退済み・削除済みも含む全員（IDの昇順。名前は残す。5章）。ユーザーのIDは返さない。`memberId` は操作している本人のメンバー。`currencyLocked` は、通貨を変えられないか（2章）。画面が変更の入口を出すかを決めるため。
+- `members` は、脱退済み・削除済みも含む全員（IDの昇順。名前は残す。5章）。ユーザーのIDは返さない。`memberId` は操作している本人のメンバー。`currencyLocked` は、通貨を変えられないか（2章）。画面が変更の入口を出すかを決めるため。`seatedMembers` は人数の上限で数える人数、`maxMembers` は上限（5章の「参加」）、`canInvite` は、いま招待を発行できるか（本人の脱退が確定していない、かつ `seatedMembers` が上限未満。未使用の招待の上限 `too_many_invites` は含まない）。画面が招待の入口を出し分けるため。
 - 一覧に出るのは、データを扱えるグループ（`active`・`leaving`）だけ。脱退済み・削除済みのグループは出さない。
 - 作成：グループ名は1〜30文字、表示名は1〜20文字（前後の空白を落とす。コードポイントで数える。制御文字は不可）。`timezone` は、アプリが端末のIANA名（`Asia/Tokyo` など）を送る（必須）。実行環境が知っている名前だけを通し、`+09:00` のようなオフセットは断る。月の境目（今月）を決めるので、黙って既定値にしない。通貨は選べる通貨だけ（2章。違えば400 `currencyCode`）。
   - 1回の `batch()` で、グループ・自分のメンバー行・初期の費目と、その月の割合（自分100%）・上限額なしの設定を書く（新しいグループには競合する相手がいないので、バージョンは読まない。グループの行を `write_token` つきで作り、後続の文に `GROUP_WRITE_GUARD` を付ける）。D1のクエリ数は、書き込みの文が5(batch1回)、認証1と、作成後に読むグループ・メンバー・通貨固定の3文を含めて9(`worker/test/groups.test.ts` で数えている)。
@@ -767,8 +768,8 @@ Webからのアカウント削除依頼（Google Play向け）の本人確認は
 | API | 本文 | 成功 |
 |---|---|---|
 | `GET /groups/:id/recurring-expenses` | なし | 200 `{ recurringExpenses: [RecurringExpense] }`。作った時刻の古い順（同じならID順）。止めたもの・終了したものも含む |
-| `POST /groups/:id/recurring-expenses` | `amountMinor`・`categoryId`・`payerMemberId`・`split`・`dayOfMonth`・`startMonth` が必須、`description`・`endMonth`・`currencyCode`（2章）・`id`（登録の識別子。支出と同じ「二重送信」。UUID（小文字）だけ）は任意 | 201 `{ recurringExpense, thisMonthSkipped }`。同じ `id` の再送は、200 `{ recurringExpense, thisMonthSkipped }`（保存済みのもの。`thisMonthSkipped` は、今月の「作らなかった」記録がいまあるか。最初の応答を受け取れなかったときも、案内を出せる） |
-| `PATCH /recurring-expenses/:id` | 登録と同じ項目（`id` を除く）のうち、変えるもの（1つ以上）と、`paused`（真偽） | 200 `{ recurringExpense, thisMonthSkipped }` |
+| `POST /groups/:id/recurring-expenses` | `amountMinor`・`categoryId`・`payerMemberId`・`split`・`dayOfMonth`・`startMonth` が必須、`description`・`endMonth`・`currencyCode`（2章）・`id`（登録の識別子。支出と同じ「二重送信」。UUID（小文字）だけ）は任意 | 201 `{ recurringExpense, thisMonthSkipped }`。同じ `id` の再送は、200 `{ recurringExpense, thisMonthSkipped }`（保存済みのもの。最初の応答を受け取れなかったときも、案内を出せる） |
+| `PATCH /recurring-expenses/:id` | 登録と同じ項目（`id` を除く）のうち、変えるもの（1つ以上）と、`paused`（真偽） | 200 `{ recurringExpense, thisMonthSkipped }`。`thisMonthSkipped` は、登録・変更・再送のどれでも同じ意味：**書いたあとに、今月の分の「作らなかった」記録（支出のIDが無い生成記録）があるか**。記録が残っているかぎり、止めて再開しても、ほかの項目を直しても `true`（今月の分は、実際に作られないため）。今月に支出を作った記録は、数えない |
 | `DELETE /recurring-expenses/:id` | なし | 204。一度も支出を作っていない固定費だけ（今月の分は作らなかった記録だけなら消せる） |
 
 - **削除（`DELETE`）は、一度も支出を作っていない固定費だけ。** 作った支出と生成記録が参照するので、一度でも作った固定費は消せない（409 `recurring_expense_in_use`。止める（`paused: true`）か、`endMonth` で終わりの月を決める）。間違えて作った固定費が、上限の件数と、通貨のロック（グループ情報の `currencyLocked`。2章）に残り続けないための入口。「作った」かは、生成記録の `expense_id` で見る（支出を作った記録。外部キーではなく、支出を消しても残る）。**今月の分は作らなかった記録（`expense_id` が `NULL`。7章）は数えず、固定費と一緒に消す。** 数えると、予定日を過ぎてから登録した固定費（月の途中の登録はよくある）が、ほとんど消せなくなる。生成記録は、支出と同じ書き込みで作る（7章）ので、支出を作った記録が無ければ、参照する支出も無い。消す間際に自動登録が作れば、バージョンが上がるので、読み直して判定し直し、消さずに409になる。**一度でも作った固定費が1件でも残っていれば、通貨は変えられないまま**（金額を持つので。生成した支出を消しても同じ）。
@@ -980,7 +981,8 @@ Webからのアカウント削除依頼（Google Play向け）の本人確認は
 - 予定日を過ぎてから登録・再開した固定費は、今月の分を作らず、来月の予定日に作ること（もともと作る時期に来ていたものは取り上げない）
 - 再開は、止めた理由によらず、`category` 以外の負担なら `split` を送り直すこと
 - 一度も支出を作っていない固定費だけが削除でき、通貨のロックと上限の件数から外れること（今月の分は作らなかった記録だけの固定費は消せて、記録も一緒に消える。支出を作った記録が1件でもあれば、支出を消していても消せない）
-- 登録の再送の200にも `thisMonthSkipped` を返すこと（月が変われば false）
+- `thisMonthSkipped` は、登録・変更・再送で同じ意味（書いたあとに、今月の作らなかった記録があるか）であること。止めて再開しても、ほかを直しても、記録がある間は true。支出を作った記録や、先月の記録だけなら false。月が変われば false
+- グループ情報の `seatedMembers`・`maxMembers`・`canInvite`（脱退が確定した人・脱退月が終わった人は数えず、その人自身は false）と、招待内容の確認の `groupFull` が、参加・発行の判定と一致すること
 - アーカイブした費目の固定費の費目を選び直しても、今月の分を作らない記録を残さないこと
 
 ---

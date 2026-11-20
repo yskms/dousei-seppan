@@ -867,16 +867,60 @@ describe('固定費のAPI', () => {
       assert.deepEqual(await skipRows(id), []);
     });
 
-    it('今月の分をすでに作っている固定費は、止めて再開しても、記録を重ねない（一意制約に落ちない）', async () => {
+    // 今月の生成記録を直接入れる。expenseId が null は「作らなかった」記録、あれば支出を作った記録。
+    const thisMonthRun = (groupId: string, recurringId: string, expenseId: string | null) =>
+      db
+        .prepare('INSERT INTO recurring_expense_runs (group_id, recurring_expense_id, scheduled_month, expense_id, created_at) VALUES (?, ?, ?, ?, ?)')
+        .bind(groupId, recurringId, '2026-11', expenseId, NOW)
+        .run();
+
+    it('今月の分をすでに作っている（支出を作った記録がある）固定費は、止めて再開しても、記録を重ねない。thisMonthSkipped は false', async () => {
       const f = await createFixture();
       const id = await insertRecurringRow(db, { groupId: f.groupId, categoryId: f.categoryId, payerMemberId: f.alice.memberId, dayOfMonth: 5 });
-      await db
-        .prepare('INSERT INTO recurring_expense_runs (group_id, recurring_expense_id, scheduled_month, expense_id, created_at) VALUES (?, ?, ?, NULL, ?)')
-        .bind(f.groupId, id, '2026-11', NOW)
-        .run();
+      await thisMonthRun(f.groupId, id, 'expense-made');
       await api.update(f.alice, id, { paused: true });
       const resumed = await api.update(f.alice, id, { paused: false });
       assert.deepEqual([resumed.status, resumed.body.thisMonthSkipped], [200, false]);
+      assert.deepEqual(await skipRows(id), [{ scheduled_month: '2026-11', expense_id: 'expense-made' }]);
+    });
+
+    it('thisMonthSkipped は、書いたあとの状態（登録・変更・再送で同じ意味）: 作らなかった記録が今月にあれば、止めて再開しても、ほかを直しても true。記録は1件のまま', async () => {
+      const f = await createFixture();
+      // 登録の応答は true（予定日を過ぎてから登録）。
+      const result = await api.create(f.alice, f.groupId, body(f, { dayOfMonth: 5 }));
+      const id = result.body.recurringExpense.id;
+      assert.equal(result.body.thisMonthSkipped, true);
+      for (const [label, patch] of [
+        ['止める', { paused: true }],
+        ['再開する', { paused: false }],
+        ['内容を直す', { description: '直した' }],
+        ['日を変える', { dayOfMonth: 10 }],
+      ] as const) {
+        const changed = await api.update(f.alice, id, patch);
+        assert.deepEqual([label, changed.status, changed.body.thisMonthSkipped], [label, 200, true]);
+      }
+      assert.deepEqual(await skipRows(id), [{ scheduled_month: '2026-11', expense_id: null }]);
+
+      // 予定日がまだの固定費は、変えても、記録が無いので false。
+      const early = await created(f, { dayOfMonth: 25 });
+      const edited = await api.update(f.alice, early.id, { description: '直した' });
+      assert.deepEqual([edited.status, edited.body.thisMonthSkipped], [200, false]);
+      // 作らなかった記録が先月のものだけなら、今月は false（今月の予定日を過ぎていても、もともと作る時期なので取り上げない）。
+      const old = await insertRecurringRow(db, { groupId: f.groupId, categoryId: f.categoryId, payerMemberId: f.alice.memberId, dayOfMonth: 5 });
+      await db
+        .prepare('INSERT INTO recurring_expense_runs (group_id, recurring_expense_id, scheduled_month, expense_id, created_at) VALUES (?, ?, ?, NULL, ?)')
+        .bind(f.groupId, old, '2026-10', NOW)
+        .run();
+      assert.equal((await api.update(f.alice, old, { description: '直した' })).body.thisMonthSkipped, false);
+    });
+
+    it('今月の「作らなかった」記録がすでにある固定費は、止めて再開しても、記録を重ねない（一意制約に落ちない）。thisMonthSkipped は true', async () => {
+      const f = await createFixture();
+      const id = await insertRecurringRow(db, { groupId: f.groupId, categoryId: f.categoryId, payerMemberId: f.alice.memberId, dayOfMonth: 5 });
+      await thisMonthRun(f.groupId, id, null);
+      await api.update(f.alice, id, { paused: true });
+      const resumed = await api.update(f.alice, id, { paused: false });
+      assert.deepEqual([resumed.status, resumed.body.thisMonthSkipped], [200, true]);
       assert.equal((await skipRows(id)).length, 1);
     });
   });

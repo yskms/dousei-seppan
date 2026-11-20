@@ -60,7 +60,11 @@ export async function loadMembers(db: D1Database, groupId: string): Promise<Memb
  * 以降）・脱退月が終わった（Cronの確定の前でも）人は数えない（入れ替わりの参加をふさがない）。脱退を選んだだけで、
  * 脱退月がまだ終わっていない人は、今月はいるので数える。判定は access.ts の `isLeaveEffectiveFor` と同じ。
  */
-export function countSeatedMembers(members: readonly MemberInfo[], timezone: string, now: number): number {
+export function countSeatedMembers(
+  members: readonly { status: string; leaveRequestedMonth: string | null }[],
+  timezone: string,
+  now: number,
+): number {
   return members.filter((member) => !isLeaveEffectiveFor(member, timezone, now)).length;
 }
 

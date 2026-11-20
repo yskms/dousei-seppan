@@ -146,8 +146,8 @@ function recurringJson(row: RecurringRow, split: SplitInput) {
 type RecurringJson = ReturnType<typeof recurringJson>;
 
 /**
- * 書き込みの応答。`thisMonthSkipped` は、今月の分を作らない記録を、この書き込みで残したか(アプリが案内する)。
- * 登録の再送(200)では、記録を残した書き込みではなく、今月の記録がいまあるか。
+ * 書き込みの応答。`thisMonthSkipped` は、書いたあとに、今月の分を「作らなかった」記録(支出のIDが無い生成記録)が
+ * あるか(アプリが「今月の分は作られません」と案内する)。登録・変更・登録の再送(200)で同じ意味。
  */
 interface WrittenRecurring {
   recurringExpense: RecurringJson;
@@ -571,20 +571,21 @@ export async function handleUpdateRecurring(
 
     // 今月の分を、この変更で**新しく**作る時期にしたとき(再開・日を過ぎた日に変更・開始月を今月にした)は、作らない記録を
     // 残す。もともと作る時期に来ていた(まだCronが作っていないだけ)なら、記録しない(作る分を取り上げない)。
+    // 応答の `thisMonthSkipped` は、書いたあとに、今月の「作らなかった」記録があるか(登録・再送と同じ意味)。記録が
+    // すでにあれば(作らなかった分も、作った分も)重ねて書かない。作った分(`expense_id` あり)は、作らなかった記録ではない。
     const thisMonth = monthIn(access.group.timezone, now);
     const today = dateIn(access.group.timezone, now);
-    let skipThisMonth = false;
-    if (isDueThisMonth(next, thisMonth, today) && !isDueThisMonth(current, thisMonth, today)) {
-      const ran = await db
-        .prepare('SELECT 1 AS found FROM recurring_expense_runs WHERE recurring_expense_id = ? AND scheduled_month = ?')
-        .bind(recurringId, thisMonth)
-        .first<{ found: number }>();
-      skipThisMonth = ran === null;
-    }
+    const thisMonthRun = await db
+      .prepare('SELECT expense_id FROM recurring_expense_runs WHERE recurring_expense_id = ? AND scheduled_month = ?')
+      .bind(recurringId, thisMonth)
+      .first<{ expense_id: string | null }>();
+    const skipThisMonth =
+      thisMonthRun === null && isDueThisMonth(next, thisMonth, today) && !isDueThisMonth(current, thisMonth, today);
+    const thisMonthSkipped = skipThisMonth || (thisMonthRun !== null && thisMonthRun.expense_id === null);
 
     const replaceAllocations = patch.split !== undefined && !(patch.split.method === 'category' && current.split_method === 'category');
     return {
-      value: { recurringExpense: recurringJson(next, split), thisMonthSkipped: skipThisMonth },
+      value: { recurringExpense: recurringJson(next, split), thisMonthSkipped },
       write: (token) => [
         ...(replaceAllocations ? [deleteAllocationsStatement(db, token, groupId, recurringId)] : []),
         updateRecurringStatement(db, token, next),

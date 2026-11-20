@@ -7,6 +7,7 @@ import { after, before, describe, it } from 'node:test';
 import { handleCreateExpense } from '../src/expenses.ts';
 import { DEFAULT_CATEGORIES } from '../src/groups.ts';
 import worker from '../src/index.ts';
+import { MAX_MEMBERS_PER_GROUP } from '../src/limits.ts';
 import {
   createFixtureFactory,
   equalShares,
@@ -63,6 +64,7 @@ describe('グループのAPI', () => {
       assert.equal(group.timezone, 'Asia/Tokyo');
       assert.equal(group.createdAt, NOW);
       assert.equal(group.currencyLocked, false);
+      assert.deepEqual([group.seatedMembers, group.maxMembers, group.canInvite], [1, MAX_MEMBERS_PER_GROUP, true]);
       assert.equal(group.members.length, 1);
       assert.equal(group.members[0].displayName, 'あきら');
       assert.equal(group.members[0].status, 'active');
@@ -313,6 +315,27 @@ describe('グループのAPI', () => {
       assert.equal(byName.newbie.historyFromMonth, '2026-11');
       assert.ok(!JSON.stringify(group).includes(f.alice.userId));
       assert.equal(group.currencyLocked, false);
+    });
+
+    it('人数の上限: 数える人数・上限・いま招待できるか（canInvite）を返す。脱退が確定した人・脱退済み・削除済みは数えない', async () => {
+      // f の参加中は alice・bob・newbie の3人。carol は脱退が確定、dave は削除済み、erin は脱退済み。
+      const group = (await api.getGroup(f.alice, f.groupId)).body.group;
+      assert.deepEqual([group.seatedMembers, group.maxMembers, group.canInvite], [3, MAX_MEMBERS_PER_GROUP, true]);
+      // 脱退が確定した人は、人数が空いていても、招待を発行できない。
+      const carol = (await api.getGroup(f.carol, f.groupId)).body.group;
+      assert.deepEqual([carol.seatedMembers, carol.canInvite], [3, false]);
+    });
+
+    it('人数の上限: 満員なら canInvite は false。脱退月が終わった人（Cronの確定の前）は数えず、その人自身も false', async () => {
+      const g = await factory.createGroup(['alice', 'bob', 'carol', 'dave', 'erin']);
+      const full = (await api.getGroup(g.people.alice, g.groupId)).body.group;
+      assert.deepEqual([full.seatedMembers, full.canInvite], [MAX_MEMBERS_PER_GROUP, false]);
+      // 脱退月（2026-10）が終わった。status は active のまま（Cronが確定するまで）。
+      await db.prepare(`UPDATE group_members SET leave_requested_month = '2026-10', expense_end_month = '2026-10' WHERE id = ?`).bind(g.people.erin.memberId).run();
+      const alice = (await api.getGroup(g.people.alice, g.groupId)).body.group;
+      assert.deepEqual([alice.seatedMembers, alice.canInvite], [MAX_MEMBERS_PER_GROUP - 1, true]);
+      const erin = (await api.getGroup(g.people.erin, g.groupId)).body.group;
+      assert.deepEqual([erin.seatedMembers, erin.canInvite], [MAX_MEMBERS_PER_GROUP - 1, false]);
     });
 
     it('メンバーでない人・脱退済みの人・他のグループの人は、区別せず404', async () => {

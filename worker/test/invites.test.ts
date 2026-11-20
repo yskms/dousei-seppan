@@ -292,9 +292,27 @@ describe('招待・参加のAPI', () => {
         groupName: 'ふたりの生活費',
         invitedByDisplayName: 'alice',
         expiresAt: NOW + INVITE_TTL_MS,
+        groupFull: false,
       });
       assert.deepEqual(await memberRows(g.groupId), members);
       assert.deepEqual([(await inviteRow(invite.id))!.consumed_at, await dataVersion(g.groupId)], [null, before]);
+    });
+
+    it(`満員（${MAX_MEMBERS_PER_GROUP}人）なら groupFull: true。表示名を入力させる前に知らせる。脱退が確定した人は数えず、何も変わらない`, async () => {
+      const g = await setup();
+      for (const name of ['carol', 'dave']) await factory.addPerson(g.groupId, name);
+      const erin = await factory.addPerson(g.groupId, 'erin');
+      const invite = await insertInviteRow(db, { groupId: g.groupId, invitedByMemberId: g.people.alice.memberId });
+      const visitor = await outsider('visitor');
+      const before = await dataVersion(g.groupId);
+      const full = await api.getInvite(visitor, invite.token);
+      assert.deepEqual([full.status, full.body.alreadyMember, full.body.groupFull], [200, false, true]);
+      // すでに参加中の人は、満員でも、グループを開くだけ（groupFull は付けない）。
+      assert.deepEqual((await api.getInvite(g.people.bob, invite.token)).body, { alreadyMember: true, groupId: g.groupId });
+      // 1人の脱退が確定すれば、空く。
+      await db.prepare(`UPDATE group_members SET status = 'leaving', leave_requested_month = '2026-10', expense_end_month = '2026-10' WHERE id = ?`).bind(erin.memberId).run();
+      assert.equal((await api.getInvite(visitor, invite.token)).body.groupFull, false);
+      assert.equal(await dataVersion(g.groupId), before, '確認では何も書かない');
     });
 
     it('すでに参加中（脱退が確定した人を含む）なら、グループを開くための情報だけを返す。使用済みの招待でも同じ', async () => {

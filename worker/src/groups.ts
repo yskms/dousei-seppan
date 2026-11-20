@@ -9,6 +9,7 @@
 import {
   authenticateRequest,
   canEditGroupSettings,
+  isLeaveEffectiveFor,
   loadGroupAccess,
 } from './access.ts';
 import { minorUnitOf } from './currencies.ts';
@@ -20,8 +21,9 @@ import {
   writeToGroupWithRetry,
 } from './groupWrite.ts';
 import { conflict, forbidden, invalidRequest, json, notFound, readJsonObject, unauthorized } from './http.ts';
+import { MAX_MEMBERS_PER_GROUP } from './limits.ts';
 import { parseUpdateMe } from './memberInput.ts';
-import { pickMemberColor } from './membership.ts';
+import { countSeatedMembers, pickMemberColor } from './membership.ts';
 import { monthIn } from './months.ts';
 import { BASIS_POINTS_TOTAL } from './settlement.ts';
 
@@ -103,7 +105,7 @@ async function isCurrencyLocked(db: D1Database, groupId: string): Promise<boolea
  * グループの情報。グループのデータを扱えるメンバー（`active`・`leaving`）でなければ null。
  * メンバーは、脱退済み・削除済みも含めて全員（名前は残す。5章）。ユーザーのIDは返さない。
  */
-async function loadGroupDetail(db: D1Database, userId: string, groupId: string) {
+async function loadGroupDetail(db: D1Database, userId: string, groupId: string, now: number) {
   const [group, members, locked] = await db.batch([
     db
       .prepare('SELECT id, name, currency_code, currency_minor_unit, timezone, created_at FROM expense_groups WHERE id = ?')
@@ -121,9 +123,25 @@ async function loadGroupDetail(db: D1Database, userId: string, groupId: string) 
   const memberRows = members.results as unknown as MemberRow[];
   const me = memberRows.find((row) => row.user_id === userId && (row.status === 'active' || row.status === 'leaving'));
   if (me === undefined) return null;
+  // 人数の上限(`MAX_MEMBERS_PER_GROUP`)で数える人数と、いま招待を発行できるか。アプリが、満員の判定を書き写さないように
+  // 返す(脱退月が終わった直後の、Cronの確定の前は、メンバーの状態だけでは分からない)。招待の発行(invites.ts)と同じ判定。
+  const seatedMembers = countSeatedMembers(
+    memberRows.map((row) => ({ status: row.status, leaveRequestedMonth: row.leave_requested_month })),
+    groupRow.timezone,
+    now,
+  );
+  const meCanIssue = !isLeaveEffectiveFor(
+    { status: me.status, leaveRequestedMonth: me.leave_requested_month },
+    groupRow.timezone,
+    now,
+  );
   return {
     ...groupJson(groupRow),
     memberId: me.id,
+    seatedMembers,
+    maxMembers: MAX_MEMBERS_PER_GROUP,
+    // 未使用の招待の上限(`too_many_invites`)は含まない(自分の招待の一覧で分かる)。
+    canInvite: meCanIssue && seatedMembers < MAX_MEMBERS_PER_GROUP,
     members: memberRows.map((row) => memberJson(row, userId)),
     // 通貨を変えられないか（`PATCH` が 409 `currency_locked` を返す条件）。画面が、変更の入口を出すかを決めるため。
     currencyLocked: (locked.results[0] as { locked: number } | undefined)?.locked === 1,
@@ -204,10 +222,10 @@ export async function handleCreateGroup(request: Request, env: Env, now: number)
     if (!isUniqueViolation(error)) throw error;
     // 同じ `id` の作成が先に済んでいる（再送、または同時の送信）。batch 全体が取り消されているので、何も書いていない。
     // 作った本人には、保存済みのグループを返す。他人のIDなら、中身を返さずに競合とする。
-    const existing = await loadGroupDetail(db, session.userId, groupId);
+    const existing = await loadGroupDetail(db, session.userId, groupId, now);
     return existing === null ? conflict('conflict') : json({ group: existing }, 200);
   }
-  const created = await loadGroupDetail(db, session.userId, groupId);
+  const created = await loadGroupDetail(db, session.userId, groupId, now);
   if (created === null) throw new Error('作ったグループを読めない');
   return json({ group: created }, 201);
 }
@@ -256,7 +274,7 @@ export async function handleListGroups(request: Request, env: Env, now: number):
 export async function handleGetGroup(request: Request, env: Env, now: number, groupId: string): Promise<Response> {
   const session = await authenticateRequest(request, env.DB, now);
   if (session === null) return unauthorized();
-  const detail = await loadGroupDetail(env.DB, session.userId, groupId);
+  const detail = await loadGroupDetail(env.DB, session.userId, groupId, now);
   return detail === null ? notFound() : json({ group: detail });
 }
 
@@ -284,7 +302,7 @@ export async function handleUpdateGroup(request: Request, env: Env, now: number,
     // 不要に競合させる)。
     const current = await db.prepare('SELECT name FROM expense_groups WHERE id = ?').bind(groupId).first<{ name: string }>();
     if (!currencyChanges && (patch.name === undefined || patch.name === current?.name)) {
-      const detail = await loadGroupDetail(db, session.userId, groupId);
+      const detail = await loadGroupDetail(db, session.userId, groupId, now);
       return { reject: detail === null ? notFound() : json({ group: detail }) };
     }
     return {
@@ -309,7 +327,7 @@ export async function handleUpdateGroup(request: Request, env: Env, now: number,
   });
   switch (outcome.status) {
     case 'written': {
-      const detail = await loadGroupDetail(db, session.userId, groupId);
+      const detail = await loadGroupDetail(db, session.userId, groupId, now);
       return detail === null ? notFound() : json({ group: detail });
     }
     case 'rejected':
@@ -347,7 +365,7 @@ export async function handleUpdateMe(request: Request, env: Env, now: number, gr
       (patch.displayName === undefined || patch.displayName === current?.display_name) &&
       (patch.color === undefined || patch.color === current?.color)
     ) {
-      const detail = await loadGroupDetail(db, session.userId, groupId);
+      const detail = await loadGroupDetail(db, session.userId, groupId, now);
       return { reject: detail === null ? notFound() : json({ group: detail }) };
     }
     return {
@@ -364,7 +382,7 @@ export async function handleUpdateMe(request: Request, env: Env, now: number, gr
   });
   switch (outcome.status) {
     case 'written': {
-      const detail = await loadGroupDetail(db, session.userId, groupId);
+      const detail = await loadGroupDetail(db, session.userId, groupId, now);
       return detail === null ? notFound() : json({ group: detail });
     }
     case 'rejected':
