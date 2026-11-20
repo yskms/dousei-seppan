@@ -780,6 +780,46 @@ describe('月次集計・月締め・締め結果のAPI', () => {
         assert.equal((await memberRow(carol.memberId))!.status, 'leaving');
       });
 
+      it('繰越先の月を締めた結果、脱退者の精算する額が0で送金が作られないなら、その締めの中で脱退済みになる', async () => {
+        const g = await setup(['alice', 'bob', 'carol']);
+        const { alice, bob, carol } = g.people;
+        // 10月（支出なし）を締める。alice の繰越が「alice → bob」と「carol → alice」の同じ額で打ち消し合う状態を、
+        // SQLで作る（送金の組み合わせの計算は、1人が払う側と受け取る側を兼ねないので、締めからは作れない）。
+        const october = await api.close(alice, g.groupId, '2026-10');
+        assert.equal(october.status, 201);
+        const closingId = (
+          await db.prepare(`SELECT id FROM monthly_closings WHERE group_id = ? AND target_month = '2026-10'`).bind(g.groupId).first<{ id: string }>()
+        )!.id;
+        for (const [from, to] of [[alice, bob], [carol, alice]]) {
+          await db
+            .prepare(
+              `INSERT INTO settlement_transfers (id, group_id, closing_id, from_member_id, to_member_id, amount_minor,
+                 status, carried_at, processed_by_member_id)
+               VALUES (?, ?, ?, ?, ?, 1000, 'carried', ?, ?)`,
+            )
+            .bind(`carried-${from.memberId}-${to.memberId}`, g.groupId, closingId, from.memberId, to.memberId, NOW, bob.memberId)
+            .run();
+        }
+        // alice は10月で脱退が確定している。11月には参加しない。
+        await db
+          .prepare(`UPDATE group_members SET status = 'leaving', expense_end_month = '2026-10' WHERE id = ?`)
+          .bind(alice.memberId)
+          .run();
+        assert.equal((await memberRow(alice.memberId))!.status, 'leaving');
+
+        // 11月: bob が +1,000、carol が -1,000、alice は 0。送金は carol → bob の1件だけ。
+        const november = await api.close(bob, g.groupId, '2026-11');
+        assert.equal(november.status, 201, JSON.stringify(november.body));
+        assert.deepEqual(
+          november.body.transfers.map((t: { fromMemberId: string; toMemberId: string; amountMinor: number }) => [t.fromMemberId, t.toMemberId, t.amountMinor]),
+          [[carol.memberId, bob.memberId, 1000]],
+        );
+        const aliceSummary = november.body.members.find((m: { memberId: string }) => m.memberId === alice.memberId);
+        assert.deepEqual([aliceSummary.carriedInMinor, aliceSummary.netMinor], [0, 0]);
+        // 関わる送金が無く、繰越先の月（11月）も締めたので、同じ書き込みの中で脱退済みになる。
+        assert.deepEqual(await memberRow(alice.memberId), { status: 'left', left_at: NOW });
+      });
+
       it('脱退月がまだ締められていなければ、他の月を締めても脱退済みにならない', async () => {
         const g = await factory.createGroup(['alice', 'bob', 'carol'], { carol: { status: 'leaving', expenseEndMonth: '2026-11' } });
         const { alice, bob, carol } = g.people;
