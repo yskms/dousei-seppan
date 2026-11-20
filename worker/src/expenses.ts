@@ -184,6 +184,11 @@ async function loadExpense(db: D1Database, groupId: string, expenseId: string): 
     .first<ExpenseRow>();
 }
 
+/** グループを問わずIDで探す（登録の再送の判定用。支出のIDは、全グループで一意）。 */
+async function loadExpenseAnywhere(db: D1Database, expenseId: string): Promise<ExpenseRow | null> {
+  return db.prepare(`SELECT ${EXPENSE_COLUMNS} FROM expenses WHERE id = ?`).bind(expenseId).first<ExpenseRow>();
+}
+
 async function loadAllocations(db: D1Database, groupId: string, expenseId: string): Promise<Allocation[]> {
   const { results } = await db
     .prepare(
@@ -420,6 +425,25 @@ export async function handleCreateExpense(request: Request, env: Env, now: numbe
     if (access === null) return { reject: notFound() };
     if (!canWriteExpenses(access, now)) return { reject: forbidden() };
 
+    // 同じIDの再送（通信が途切れて、アプリが同じ登録をもう一度送った）は、新しく作らず、保存済みの支出を200で返す。
+    // 内容は見比べず、保存済みのものをそのまま返す（最初の登録のあとに編集されていれば、編集後の状態）。
+    // 判定は、バージョンを読んだあとのこの中で行う。最初の登録と再送が同時に走っても、負けたほうは競合になり、
+    // やり直した判定で、勝ったほうの支出を見つける。
+    // 登録した人と別のメンバー・別のグループが使っているIDは、そのIDの存在を教えないよう、競合と同じ409にする。
+    // 判定は、登録できる月・メンバーの検査より前に行う（再送の間に月が締められても、同じ結果を返すため）。
+    // 消した支出のIDの再送は、新しい登録として扱う（消したことは、IDからは分からない）。
+    // 200の返却にも `reject` を使う（意味は「書かずに、この応答をそのまま返す」。バージョンも上げない）。
+    if (input.id !== null) {
+      const existing = await loadExpenseAnywhere(db, input.id);
+      if (existing !== null) {
+        if (existing.group_id !== groupId || existing.created_by_member_id !== access.member.id) {
+          return { reject: conflict('conflict') };
+        }
+        const allocations = await loadAllocations(db, groupId, existing.id);
+        return { reject: json({ expense: expenseJson(existing, allocations) }) };
+      }
+    }
+
     const [range, category, members] = await Promise.all([
       registerableMonths(db, access, now),
       loadCategory(db, groupId, input.categoryId),
@@ -443,7 +467,7 @@ export async function handleCreateExpense(request: Request, env: Env, now: numbe
     if (!built.ok) return { reject: invalidRequest(built.field) };
 
     const row: ExpenseRow = {
-      id: crypto.randomUUID(),
+      id: input.id ?? crypto.randomUUID(),
       group_id: groupId,
       expense_date: input.expenseDate,
       target_month: input.targetMonth,

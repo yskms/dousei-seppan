@@ -383,6 +383,32 @@ describe('月次集計・月締め・締め結果のAPI', () => {
       );
     });
 
+    it('通貨の小数桁数（USD 2・KWD 3）に依らず、金額は最小単位の整数のまま計算し、締めた時点の通貨を残す', async () => {
+      for (const [currency, minorUnit] of [
+        ['USD', 2],
+        ['KWD', 3],
+      ] as const) {
+        const g = await setup(['alice', 'bob']);
+        await db
+          .prepare('UPDATE expense_groups SET currency_code = ?, currency_minor_unit = ? WHERE id = ?')
+          .bind(currency, minorUnit, g.groupId)
+          .run();
+        // 12.345 KWD（12345）・123.45 USD（12345）。2人の均等割りの端数は、固定順の先頭に1単位。
+        await pay(g, g.people.alice, 12345);
+
+        const { body } = await api.close(g.people.bob, g.groupId, '2026-10');
+        assert.equal(body.transfers.length, 1);
+        assert.equal(body.transfers[0].amountMinor, 6172, currency);
+        assert.deepEqual(
+          await db
+            .prepare('SELECT currency_code, currency_minor_unit FROM monthly_closings WHERE group_id = ?')
+            .bind(g.groupId)
+            .first(),
+          { currency_code: currency, currency_minor_unit: minorUnit },
+        );
+      }
+    });
+
     describe('締められない条件（4章）', () => {
       it('まだ始まっていない月（12月に11月19日）', async () => {
         const g = await setup(['alice', 'bob']);

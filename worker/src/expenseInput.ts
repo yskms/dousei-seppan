@@ -17,6 +17,11 @@ export type SplitInput =
   | { method: 'single'; memberId: string };
 
 export interface CreateExpenseInput {
+  /**
+   * アプリが作る、この登録の識別子（冪等キー）。通信が途切れて同じ登録を再送したときに、支出が2件できないように
+   * する（docs/backend-design.md 8章「支出の二重送信」）。無ければ、Workerが決める（再送は防げない）。
+   */
+  id: string | null;
   expenseDate: string;
   targetMonth: string;
   description: string | null;
@@ -150,9 +155,13 @@ const EXPENSE_KEYS = [
   'split',
 ] as const;
 
+// 登録だけが `id` を受け取る。編集（PATCH）で支出のIDは変えられない。
+const CREATE_EXPENSE_KEYS = ['id', ...EXPENSE_KEYS] as const;
+
 export function parseCreateExpense(body: Record<string, unknown>): ParseResult<CreateExpenseInput> {
-  const extra = unknownKey(body, EXPENSE_KEYS);
+  const extra = unknownKey(body, CREATE_EXPENSE_KEYS);
   if (extra !== null) return fail(extra);
+  if (body.id !== undefined && !isId(body.id)) return fail('id');
   if (!isDate(body.expenseDate)) return fail('expenseDate');
   if (!isMonth(body.targetMonth)) return fail('targetMonth');
   const description = parseDescription(body.description === undefined ? null : body.description);
@@ -165,6 +174,7 @@ export function parseCreateExpense(body: Record<string, unknown>): ParseResult<C
   return {
     ok: true,
     value: {
+      id: body.id === undefined ? null : body.id,
       expenseDate: body.expenseDate,
       targetMonth: body.targetMonth,
       description: description.value,

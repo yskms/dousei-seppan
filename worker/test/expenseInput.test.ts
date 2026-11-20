@@ -20,7 +20,17 @@ describe('支出の登録の入力', () => {
   it('正しい入力を読む', () => {
     const result = parseCreateExpense(valid);
     assert.ok(result.ok);
-    assert.deepEqual(result.value, { ...valid, split: { method: 'category' } });
+    // id は任意。無ければ null（Workerが決める）。
+    assert.deepEqual(result.value, { ...valid, id: null, split: { method: 'category' } });
+  });
+
+  it('id（アプリが作る、登録の識別子）は任意。IDの形だけを受け付ける', () => {
+    const result = create({ id: 'expense-1_A' });
+    assert.ok(result.ok);
+    assert.equal(result.value.id, 'expense-1_A');
+    for (const id of ['', 'a b', 'あ', 'x'.repeat(65), 1, null, {}]) {
+      assert.equal(failedField(create({ id })), 'id', JSON.stringify(id));
+    }
   });
 
   it('内容は任意で、無ければ null。前後の空白は落とし、空なら null', () => {
@@ -80,7 +90,7 @@ describe('支出の登録の入力', () => {
     assert.equal(failedField(create({ categoryId: 'a b' })), 'categoryId');
     assert.equal(failedField(create({ payerMemberId: 'x'.repeat(65) })), 'payerMemberId');
     assert.equal(failedField(create({ payerMemberID: 'member-1' })), 'payerMemberID');
-    assert.equal(failedField(create({ id: 'expense-1' })), 'id');
+    assert.equal(failedField(create({ expenseId: 'expense-1' })), 'expenseId');
   });
 });
 
@@ -180,6 +190,8 @@ describe('支出の編集の入力', () => {
   it('空の本文・知らない項目・不正な値は断る', () => {
     assert.deepEqual(parseUpdateExpense({}), { ok: false, field: '' });
     assert.deepEqual(parseUpdateExpense({ foo: 1 }), { ok: false, field: 'foo' });
+    // 編集で、支出のIDは変えられない（id は登録だけが受け取る）。
+    assert.deepEqual(parseUpdateExpense({ id: 'expense-1' }), { ok: false, field: 'id' });
     assert.deepEqual(parseUpdateExpense({ amountMinor: 0 }), { ok: false, field: 'amountMinor' });
     assert.deepEqual(parseUpdateExpense({ targetMonth: '2026-13' }), { ok: false, field: 'targetMonth' });
     assert.deepEqual(parseUpdateExpense({ split: { method: 'nope' } }), { ok: false, field: 'split.method' });

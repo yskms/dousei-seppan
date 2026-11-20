@@ -13,6 +13,7 @@ import {
 import worker from '../src/index.ts';
 import { createFixtureFactory, insertClosing, NOW, type Fixture, type Person } from './apiFixture.ts';
 import { openLocalDatabase, type LocalDatabase } from './localDatabase.ts';
+import { interferingEnv } from './monthApi.ts';
 
 interface ApiResult {
   status: number;
@@ -658,9 +659,135 @@ describe('支出のAPI', () => {
         assert.notEqual(await expenseRow(deleteId), null);
       });
     });
+
+    // 通信が途切れて、アプリが同じ登録を再送したときに、支出が2件できないこと（8章「支出の二重送信」）。
+    describe('二重送信（同じIDの再送）', () => {
+      let sequence = 0;
+      /** DBはテストの間で共有しているので、テストごとに別のIDを使う。 */
+      const newId = () => `retry-${++sequence}`;
+
+      it('IDを指定して登録すると、そのIDの支出になる。同じ登録の再送は、新しく作らず、保存済みの支出を200で返す', async () => {
+        const f = await createFixture();
+        const id = newId();
+        const payload = body(f, { id, split: { method: 'equal', memberIds: [f.alice.memberId, f.bob.memberId] } });
+        const first = await create(f, f.alice, payload);
+        assert.equal(first.status, 201);
+        assert.equal(first.body.expense.id, id);
+
+        const version = await dataVersion(f.groupId);
+        const again = await create(f, f.alice, payload);
+        assert.deepEqual(again, { status: 200, body: first.body });
+        assert.equal(await expenseCount(f.groupId), 1);
+        assert.equal((await allocationRows(id)).length, 2);
+        // 何も書いていない（バージョンも上がらない）。
+        assert.equal(await dataVersion(f.groupId), version);
+      });
+
+      it('IDの形が違えば400（field: id）。編集では、支出のIDを送れない', async () => {
+        const f = await createFixture();
+        for (const id of ['', 'a b', 'あ', 'x'.repeat(65), 1, null]) {
+          const result = await create(f, f.alice, body(f, { id }));
+          assert.deepEqual([result.status, result.body], [400, { error: 'invalid_request', field: 'id' }], String(id));
+        }
+        assert.equal(await expenseCount(f.groupId), 0);
+        const expenseId = await register(f);
+        assert.deepEqual(await update(f.alice, expenseId, { id: newId() }), {
+          status: 400,
+          body: { error: 'invalid_request', field: 'id' },
+        });
+      });
+
+      it('再送は、内容を見比べず、保存済みの状態を返す（最初の登録のあとに編集されていれば、編集後。月が締められたあとでも）', async () => {
+        const f = await createFixture();
+        const id = newId();
+        const payload = body(f, { id });
+        assert.equal((await create(f, f.alice, payload)).status, 201);
+        assert.equal((await update(f.bob, id, { amountMinor: 5000 })).status, 200);
+        await insertClosing(db, f.groupId, '2026-11', f.alice.memberId);
+
+        const again = await create(f, f.alice, payload);
+        assert.equal(again.status, 200);
+        assert.equal(again.body.expense.amountMinor, 5000);
+        assert.equal(await expenseCount(f.groupId), 1);
+      });
+
+      it('権限の確認は、再送でも行う（セッション無し401、メンバーでない人404、脱退が確定した人403）', async () => {
+        const f = await createFixture();
+        const id = newId();
+        assert.equal((await create(f, f.alice, body(f, { id }))).status, 201);
+        assert.equal((await create(f, null, body(f, { id }))).status, 401);
+        assert.deepEqual(await create(f, f.outsider, body(f, { id })), { status: 404, body: { error: 'not_found' } });
+        assert.equal((await create(f, f.erin, body(f, { id }))).status, 404);
+        // 脱退が確定した人は、自分が登録した支出でも、再送を受け付けない（書き込みができないため）。
+        const carolId = newId();
+        assert.equal((await create(f, f.carol, body(f, { id: carolId, payerMemberId: f.bob.memberId }))).status, 403);
+        assert.equal(await expenseRow(carolId), null);
+      });
+
+      it('別のメンバーが登録した支出のID・別のグループの支出のIDは、409 conflict（中身を返さず、何も書かない）', async () => {
+        const f = await createFixture();
+        const id = newId();
+        assert.equal((await create(f, f.alice, body(f, { id }))).status, 201);
+        const version = await dataVersion(f.groupId);
+        const otherVersion = await dataVersion(f.other.groupId);
+
+        // 同じグループの、登録した人とは別のメンバー。
+        assert.deepEqual(await create(f, f.bob, body(f, { id, payerMemberId: f.bob.memberId })), {
+          status: 409,
+          body: { error: 'conflict' },
+        });
+        // 別のグループのメンバーが、自分のグループへの登録に、同じIDを使う。
+        const foreign = await create(
+          f,
+          f.other.member,
+          body(f, { id, categoryId: f.other.categoryId, payerMemberId: f.other.member.memberId }),
+          { groupId: f.other.groupId },
+        );
+        assert.deepEqual(foreign, { status: 409, body: { error: 'conflict' } });
+
+        assert.equal(await dataVersion(f.groupId), version);
+        assert.equal(await dataVersion(f.other.groupId), otherVersion);
+        assert.equal((await expenseRow(id))!.group_id, f.groupId);
+        assert.equal(await expenseCount(f.other.groupId), 0);
+      });
+
+      it('同時に送られた同じ登録でも、1件だけできる。負けた側は、やり直した判定で、保存済みの支出を200で返す', async () => {
+        const f = await createFixture();
+        const id = newId();
+        const payload = body(f, { id });
+        // 再送が検証を終えたあと、書き込みの直前に、最初の登録が書き込まれる。
+        let firstResult: ApiResult | null = null;
+        const racing = interferingEnv(env, async () => {
+          firstResult = await create(f, f.alice, payload);
+        });
+        const retried = await create(f, f.alice, payload, { env: racing });
+        assert.equal(firstResult!.status, 201);
+        assert.equal(retried.status, 200);
+        assert.deepEqual(retried.body, firstResult!.body);
+        assert.equal(await expenseCount(f.groupId), 1);
+      });
+
+      it('消した支出のIDの再送は、新しい登録として扱う（IDからは、消したことが分からない）', async () => {
+        const f = await createFixture();
+        const id = newId();
+        assert.equal((await create(f, f.alice, body(f, { id }))).status, 201);
+        assert.equal((await remove(f.alice, id)).status, 204);
+        assert.equal(await expenseCount(f.groupId), 0);
+        assert.equal((await create(f, f.alice, body(f, { id }))).status, 201);
+        assert.equal(await expenseCount(f.groupId), 1);
+      });
+
+      it('IDを送らなければ、Workerが決める。再送は防げない（IDを送るのは、アプリの役割）', async () => {
+        const f = await createFixture();
+        const first = await create(f, f.alice, body(f));
+        const second = await create(f, f.alice, body(f));
+        assert.notEqual(first.body.expense.id, second.body.expense.id);
+        assert.equal(await expenseCount(f.groupId), 2);
+      });
+    });
   });
 
-  // === 編集 ====================================================================================
+  // === 編集 ===================================================================================
 
   describe('編集（PATCH /expenses/:id）', () => {
     it('送った項目だけを変える。金額・内容・日付・カテゴリ・支払者を変えられる', async () => {
