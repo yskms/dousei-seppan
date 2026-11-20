@@ -85,6 +85,7 @@ export async function runScheduled(env: Env, now: number, queryBudget = QUERY_BU
       deferredGroups: [],
       failedGroups: [],
       postponedGroups: [],
+      invalidTemplates: [],
       skipped: false,
       queries: 0,
     },
@@ -115,7 +116,11 @@ export async function runScheduled(env: Env, now: number, queryBudget = QUERY_BU
   summary.recurring = await registerDueRecurring(env.DB, now, summary.queries, queryBudget);
   summary.queries += summary.recurring.queries;
 
+  // 作れなかった固定費（不整合）も、気づけるように失敗として投げる。ほかのグループ・固定費は、もう作っている。
   const failed = summary.failedGroups.length + summary.recurring.failedGroups.length;
   if (failed > 0) throw new Error(`定期処理で失敗したグループがある: ${failed}件`);
+  if (summary.recurring.invalidTemplates.length > 0) {
+    throw new Error(`定期処理で作れなかった固定費がある: ${summary.recurring.invalidTemplates.length}件`);
+  }
   return summary;
 }

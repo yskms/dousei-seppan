@@ -1,5 +1,5 @@
 // 固定費のAPIのテストで使う、呼び出しの道具（monthApi.ts と同じ作り）。
-import { handleCreateRecurring, handleListRecurring, handleUpdateRecurring } from '../src/recurring.ts';
+import { handleCreateRecurring, handleDeleteRecurring, handleListRecurring, handleUpdateRecurring } from '../src/recurring.ts';
 import { NOW, type Person } from './apiFixture.ts';
 import { read, request, type ApiResult } from './monthApi.ts';
 
@@ -19,5 +19,7 @@ export function recurringApi(defaultEnv: Env) {
       read(await handleCreateRecurring(request('POST', `/groups/${groupId}/recurring-expenses`, token(who), body), ...opts(options), groupId)),
     update: async (who: Person | null, recurringId: string, body: unknown, options: Options = {}): Promise<ApiResult> =>
       read(await handleUpdateRecurring(request('PATCH', `/recurring-expenses/${recurringId}`, token(who), body), ...opts(options), recurringId)),
+    remove: async (who: Person | null, recurringId: string, options: Options = {}): Promise<ApiResult> =>
+      read(await handleDeleteRecurring(request('DELETE', `/recurring-expenses/${recurringId}`, token(who)), ...opts(options), recurringId)),
   };
 }

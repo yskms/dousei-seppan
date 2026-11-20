@@ -354,21 +354,24 @@ describe('固定費の自動登録', () => {
     it('APIで登録した固定費が、予定日に支出になり、支出の一覧に出る（固定費のIDつき）。停止すると作られない', async () => {
       const f = await factory();
       const api = recurringApi(env);
-      const create = (description: string, dayOfMonth: number) =>
+      // NOW は11月19日。25日の固定費は、まだ予定日が来ていない。
+      const create = (description: string) =>
         api.create(f.alice, f.groupId, {
           description,
           amountMinor: 3000,
           categoryId: f.categoryId,
           payerMemberId: f.bob.memberId,
           split: { method: 'ratio', shares: [{ memberId: f.alice.memberId, basisPoints: 6000 }, { memberId: f.bob.memberId, basisPoints: 4000 }] },
-          dayOfMonth,
+          dayOfMonth: 25,
           startMonth: '2026-11',
         });
-      const active = (await create('回線', 5)).body.recurringExpense;
-      const stopped = (await create('停止', 5)).body.recurringExpense;
+      const active = (await create('回線')).body.recurringExpense;
+      const stopped = (await create('停止')).body.recurringExpense;
       await api.update(f.alice, stopped.id, { paused: true });
 
       await run(NOW);
+      assert.equal((await expensesOf(f.groupId)).length, 0, '予定日の前');
+      await run(NOV_25_0030_JST);
 
       const list = await read(
         await handleListExpenses(request('GET', `/groups/${f.groupId}/expenses?month=2026-11`, f.alice.token), env, NOW, f.groupId),
@@ -379,7 +382,7 @@ describe('固定費の自動登録', () => {
         { ...list.body.expenses[0], id: undefined },
         {
           id: undefined,
-          expenseDate: '2026-11-05',
+          expenseDate: '2026-11-25',
           targetMonth: '2026-11',
           description: '回線',
           amountMinor: 3000,
@@ -392,13 +395,45 @@ describe('固定費の自動登録', () => {
             { memberId: f.alice.memberId, burdenMinor: 1800, shareBasisPoints: 6000 },
             { memberId: f.bob.memberId, burdenMinor: 1200, shareBasisPoints: 4000 },
           ],
-          createdAt: NOW,
-          updatedAt: NOW,
+          createdAt: NOV_25_0030_JST,
+          updatedAt: NOV_25_0030_JST,
         },
       );
       // 生成済みの支出は、固定費を変えても変わらない（まだ作っていない月の分から反映する）。
       await api.update(f.alice, active.id, { amountMinor: 9999 });
       assert.equal((await expensesOf(f.groupId))[0]!.amount_minor, 3000);
+    });
+
+    it('予定日を過ぎてから登録・再開した固定費は、今月の分を作らず（手で入力した分と二重にならない）、来月の予定日に作る', async () => {
+      const f = await factory();
+      const api = recurringApi(env);
+      // 11月19日に、毎月5日の固定費を登録する。
+      const result = await api.create(f.alice, f.groupId, {
+        description: '家賃',
+        amountMinor: 80000,
+        categoryId: f.categoryId,
+        payerMemberId: f.alice.memberId,
+        split: { method: 'category' },
+        dayOfMonth: 5,
+        startMonth: '2026-11',
+      });
+      assert.equal(result.body.thisMonthSkipped, true);
+      await run(NOW);
+      await run(NOV_30_NOON_JST);
+      assert.equal((await expensesOf(f.groupId)).length, 0, '今月の分は作らない');
+      await run(NOW_DECEMBER);
+      assert.deepEqual(
+        (await expensesOf(f.groupId)).map((expense) => [expense.expense_date, expense.target_month]),
+        [['2026-12-05', '2026-12']],
+      );
+
+      // 止めて、予定日を過ぎてから再開しても、同じ。
+      const stopped = await api.update(f.alice, result.body.recurringExpense.id, { paused: true }, { now: NOW_DECEMBER + 1000 });
+      assert.equal(stopped.status, 200);
+      const resumed = await api.update(f.alice, result.body.recurringExpense.id, { paused: false }, { now: NOW_DECEMBER + 2000 });
+      assert.equal(resumed.body.thisMonthSkipped, false, '12月の分は、もう作っている（記録を重ねない）');
+      await run(NOW_DECEMBER + 3_600_000);
+      assert.equal((await expensesOf(f.groupId)).length, 1);
     });
   });
 });
@@ -497,6 +532,46 @@ describe('固定費の自動登録: D1のクエリ数の予算', () => {
       assert.ok(!lines.some((line) => /SCAN u/.test(line)), lines.join(' / '));
     }
     assert.ok((await plan(true)).some((line) => /idx_recurring_expenses_group/.test(line)));
+  });
+
+  it('固定費もメンバーも多いグループは、書く文の数を数えて、予算に収まる件数だけ作る。残りは次の回で作る（50を超えない）', async () => {
+    // 50件 × 12人の金額指定 = 負担額600行。全部を1回で書くと、読み込みと合わせて51クエリになり、Freeの上限（50）を超える。
+    const names = Array.from({ length: 12 }, (_, index) => `m${String(index + 1).padStart(2, '0')}`);
+    const g = await factory.createGroup(names);
+    const ids = names.map((name) => g.people[name]!.memberId);
+    for (let i = 0; i < 50; i++) {
+      await insertRecurringRow(db, {
+        groupId: g.groupId,
+        categoryId: g.categoryId,
+        payerMemberId: ids[0]!,
+        dayOfMonth: 5,
+        description: `固定費${i}`,
+        splitMethod: 'fixed',
+        amountMinor: 12000,
+        allocations: ids.map((id) => [id, null, 1000] as const),
+      });
+    }
+
+    let created = 0;
+    for (let round = 0; round < 5; round++) {
+      const counting = countingEnv(env);
+      const summary = await registerDueRecurring(counting.env.DB, NOW, 0, 50);
+      assert.equal(summary.queries, counting.counts.queries, `${round}回目: 数えた数と報告する数が一致する`);
+      assert.ok(counting.counts.queries <= 50, `${round}回目: ${counting.counts.queries} クエリ`);
+      created += summary.createdExpenses;
+      if (round === 0) {
+        assert.ok(summary.createdExpenses > 0 && summary.createdExpenses < 50, `1回目は一部だけ: ${summary.createdExpenses}`);
+        assert.deepEqual(summary.createdGroups, [g.groupId]);
+        assert.deepEqual(summary.postponedGroups, [g.groupId], '残りを次の回に回した');
+      }
+      if (summary.postponedGroups.length === 0) break;
+    }
+    assert.equal(created, 50);
+    assert.equal(await expenseCount(g.groupId), 50, '二重に作らず、全部作った');
+    const burdens = await db.prepare('SELECT count(*) AS n FROM expense_allocations WHERE group_id = ?').bind(g.groupId).first<{ n: number }>();
+    assert.equal(burdens!.n, 600);
+    const runs = await db.prepare('SELECT count(*) AS n FROM recurring_expense_runs WHERE group_id = ?').bind(g.groupId).first<{ n: number }>();
+    assert.equal(runs!.n, 50);
   });
 
   it('予算が残っていなければ（脱退の確定が使い切った）、この処理そのものを見送る。何も読まない', async () => {
@@ -619,6 +694,29 @@ describe('固定費の自動登録: 競合と、脱退の確定との順序（�
       const state = await db.prepare('SELECT paused_at FROM recurring_expenses WHERE group_id = ?').bind(g.groupId).first<{ paused_at: number | null }>();
       assert.equal(state!.paused_at, null, '確定が済んでいないので、止まっていない');
       assert.equal((await expensesIn(db, g.groupId)).length, 0, 'それでも、脱退する人が支払者の支出は作らない');
+    }));
+
+  it('負担設定が合わない固定費（不整合）だけを飛ばして、同じグループのほかの固定費は作る。定期処理は、気づけるように失敗として投げる', () =>
+    isolated(async ({ db, env, factory }) => {
+      const g = await factory.createGroup(['alice', 'bob']);
+      const a = g.people.alice.memberId;
+      const b = g.people.bob.memberId;
+      const base = { groupId: g.groupId, categoryId: g.categoryId, payerMemberId: a, dayOfMonth: 5 };
+      // 単独なのに、負担設定の行が無い。
+      const noRows = await insertRecurringRow(db, { ...base, description: '行が無い', splitMethod: 'single' });
+      // 金額指定の合計が、金額（80000）と合わない。
+      const mismatch = await insertRecurringRow(db, { ...base, description: '合計が違う', splitMethod: 'fixed', allocations: [[a, null, 1000], [b, null, 1000]] });
+      await insertRecurringRow(db, { ...base, description: '正常' });
+
+      const direct = await registerDueRecurring(db, NOW, 0, 1000);
+      assert.deepEqual([...direct.invalidTemplates].sort(), [mismatch, noRows].sort());
+      assert.deepEqual(direct.failedGroups, [], 'グループの失敗にはしない');
+      assert.deepEqual(direct.createdGroups, [g.groupId]);
+      assert.deepEqual((await expensesIn(db, g.groupId)).map((expense) => expense.description), ['正常']);
+
+      // 定期処理は、毎回、失敗として投げる（直るまで気づける）。正常な固定費は、二重に作らない。
+      await assert.rejects(runScheduled(env, NOW + 3_600_000), /作れなかった固定費がある: 2件/);
+      assert.equal((await expensesIn(db, g.groupId)).length, 1);
     }));
 
   it('定期処理の入口（scheduled）から動く。要約に、作ったグループと数が入る', () =>

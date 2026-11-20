@@ -47,6 +47,16 @@ export type GroupWriteResult =
 /** D1の、1つの文に束縛できる値の上限。 */
 const MAX_BOUND_PARAMETERS = 100;
 
+/** `insertRowsGuarded` が、1つの文に入れる行数（束縛の上限から、条件の2つ分を引いて、列の数で割る）。 */
+export function rowsPerStatement(columnCount: number): number {
+  return Math.floor((MAX_BOUND_PARAMETERS - 2) / columnCount);
+}
+
+/** `insertRowsGuarded` が作る文の数（行が無ければ0）。書く文の数を、書く前に見積もるのに使う。 */
+export function statementsForRows(columnCount: number, rowCount: number): number {
+  return Math.ceil(rowCount / rowsPerStatement(columnCount));
+}
+
 /**
  * 同じ表への複数行のINSERT。GROUP_WRITE_GUARD の条件つき。D1はbatchの1文を1クエリと数える（Freeは1回の
  * 呼び出しにつき50）ので、月締めのように行数が多い書き込みは、束縛の上限（100）に収まる範囲で、複数行を
@@ -60,13 +70,12 @@ export function insertRowsGuarded(
   columns: readonly string[],
   rows: readonly (readonly (string | number | null)[])[],
 ): D1PreparedStatement[] {
-  const guardParameters = 2;
-  const rowsPerStatement = Math.floor((MAX_BOUND_PARAMETERS - guardParameters) / columns.length);
+  const perStatement = rowsPerStatement(columns.length);
   // 1行も入らない列数だと、下のループが進まなくなる。
-  if (rowsPerStatement < 1) throw new Error(`列が多すぎて、1文に1行も入らない: ${table}（${columns.length}列）`);
+  if (perStatement < 1) throw new Error(`列が多すぎて、1文に1行も入らない: ${table}（${columns.length}列）`);
   const statements: D1PreparedStatement[] = [];
-  for (let start = 0; start < rows.length; start += rowsPerStatement) {
-    const chunk = rows.slice(start, start + rowsPerStatement);
+  for (let start = 0; start < rows.length; start += perStatement) {
+    const chunk = rows.slice(start, start + perStatement);
     const placeholders = `(${columns.map(() => '?').join(', ')})`;
     const selected = columns.map((_, index) => `column${index + 1}`).join(', ');
     statements.push(

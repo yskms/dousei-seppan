@@ -8,16 +8,17 @@
 // - 書き込みは、グループごとに1回の `writeToGroup`(バージョンを1つ上げる)。読み込みは、バージョンを読んだ**あと**
 //   (8章)。候補を探す最初の1回は、どのグループを調べるかを決めるだけで、書く内容には使わない。
 // - 'version'(利用者の操作との競合)は、やり直さず、次の回に回す。同じ処理を何度動かしても、結果は変わらない(冪等)。
-import { monthIn, dateIn, nextMonth, scheduledDate } from './months.ts';
-import { isMemberAvailable, loadMembers, splitMemberRefs, type MemberRow } from './expenses.ts';
-import { insertRowsGuarded, readDataVersion, writeToGroup } from './groupWrite.ts';
-import { splitExpense } from './settlement.ts';
+import { buildAllocations, isMemberAvailable, loadMembers, splitMemberRefs, type MemberRow } from './expenses.ts';
+import { insertRowsGuarded, readDataVersion, statementsForRows, writeToGroup } from './groupWrite.ts';
+import { dateIn, monthIn, recurringTargetMonth, scheduledDate } from './months.ts';
 import { splitFromRows, type RecurringAllocationRow, type SplitMethod } from './recurring.ts';
 
 /**
- * 次のグループに使うクエリ数の見積もり(予算に収まるかの判定に使う)。読み込み5(版・固定費・負担設定・メンバー・
- * 締めた月)と、書き込み(バージョン・支出・負担額・生成記録で4)。固定費が多いグループは、支出の行を複数の文に分けるので
- * 増えるが、上限(50件)でも40に届かない(`worker/test/recurringRun.test.ts` で数えている)。
+ * 1つのグループで、固定費を1件でも作れる最小の費用の見積もり(これだけ予算が残っていなければ、グループに手を付けない)。
+ * 読み込み5(版・固定費・負担設定・メンバー・締めた月)と、最小の書き込み(バージョン・支出・負担額・生成記録で4)と、
+ * 一意制約違反のときの確認1回に、余裕を足した値。**実際の費用の見積もりではない。** 書く文の数は、固定費の数と
+ * メンバーの数で増える(個別の負担は「固定費 × メンバー」行)ので、グループごとに、読んだあとで書く文の数を数え、
+ * 残りの予算に収まる件数だけを作る(残りは次の回。`registerForGroup`)。
  */
 export const ESTIMATED_QUERIES_PER_RECURRING_GROUP = 12;
 
@@ -30,8 +31,16 @@ export interface RecurringRunSummary {
   deferredGroups: string[];
   /** 想定外のエラーで作れなかったグループ。 */
   failedGroups: string[];
-  /** 予算が尽きて、この回は手を付けなかったグループ。 */
+  /**
+   * 予算が尽きて、この回は手を付けなかったグループ。予算に収まらず、固定費の一部だけ作って、残りを次の回に回した
+   * グループも入る(`createdGroups` にも入る)。
+   */
   postponedGroups: string[];
+  /**
+   * 作れなかった固定費(負担設定が合わない、など。あってはならない不整合)。その固定費だけ飛ばして、同じグループの
+   * ほかの固定費は作る。ログに残し、定期処理は最後に失敗として投げる(気づけるように)。
+   */
+  invalidTemplates: string[];
   /** 予算が尽きて、この処理そのものを見送ったか(候補を探す1回も使わなかった)。 */
   skipped: boolean;
   /** この処理が使ったD1のクエリ数。 */
@@ -123,11 +132,14 @@ async function findGroupsWithDueTemplates(db: D1Database, now: number): Promise<
   return [...new Set(results.filter((row) => dueOf(row, months, now) !== null).map((row) => row.group_id))].sort();
 }
 
-type GroupResult = 'created' | 'nothing' | 'deferred';
+type GroupResult = 'created' | 'nothing' | 'deferred' | 'postponed';
 
 interface GroupOutcome {
   result: GroupResult;
   createdExpenses: number;
+  /** 作る時期に来ていたが、予算に収まらず、次の回に回した固定費の数。 */
+  remaining: number;
+  invalidTemplates: string[];
   /** この処理が使ったクエリ数。 */
   queries: number;
 }
@@ -158,15 +170,53 @@ function allAvailable(members: Map<string, MemberRow>, memberIds: readonly strin
   });
 }
 
+type Row = (string | number | null)[];
+
+/** 1つの固定費から作る行。 */
+interface Bundle {
+  recurringId: string;
+  scheduledMonth: string;
+  expense: Row;
+  burdens: Row[];
+  run: Row;
+}
+
+/** 書く文の数(バージョンを上げる1文を含む)に、一意制約違反のときの確認1回を足した、最悪のクエリ数。 */
+function writeCost(bundles: readonly Bundle[]): number {
+  const burdens = bundles.reduce((sum, bundle) => sum + bundle.burdens.length, 0);
+  return (
+    1 +
+    statementsForRows(EXPENSE_COLUMNS.length, bundles.length) +
+    statementsForRows(ALLOCATION_COLUMNS.length, burdens) +
+    statementsForRows(RUN_COLUMNS.length, bundles.length) +
+    1
+  );
+}
+
 /**
- * 1つのグループの、作る時期に来ている固定費をすべて、1回の書き込みで作る。
+ * 1つのグループの、作る時期に来ている固定費を、1回の書き込みで作る。`queriesLeft` は、この回の残りの予算。
  * バージョンを先に読み、そのあとで固定費・メンバー・締めた月を読む(8章)。
+ *
+ * 書く文の数は、固定費の数 × メンバーの数で増える(個別の負担は1行ずつ)。読んだあとで数え、残りの予算に収まる
+ * 件数(固定費のID順の先頭から)だけ作る。収まらない固定費は、生成記録が無いままなので、次の回が作る。
  */
-async function registerForGroup(db: D1Database, groupId: string, now: number): Promise<GroupOutcome> {
+async function registerForGroup(
+  db: D1Database,
+  groupId: string,
+  now: number,
+  queriesLeft: number,
+): Promise<GroupOutcome> {
   let queries = 0;
+  const nothing = (result: GroupResult, invalidTemplates: string[] = [], remaining = 0): GroupOutcome => ({
+    result,
+    createdExpenses: 0,
+    remaining,
+    invalidTemplates,
+    queries,
+  });
   const version = await readDataVersion(db, groupId);
   queries += 1;
-  if (version === null) return { result: 'nothing', createdExpenses: 0, queries };
+  if (version === null) return nothing('nothing');
 
   const months = candidateMonths(now);
   const [templates, allocations, members, closed] = await Promise.all([
@@ -194,66 +244,78 @@ async function registerForGroup(db: D1Database, groupId: string, now: number): P
   }
   const latestClosed = closed?.month ?? null;
 
-  const expenses: (string | number | null)[][] = [];
-  const burdens: (string | number | null)[][] = [];
-  const runs: (string | number | null)[][] = [];
-  const attempted: { recurringId: string; scheduledMonth: string }[] = [];
+  const bundles: Bundle[] = [];
+  const invalidTemplates: string[] = [];
   const due = templates.results
     .map((template) => dueOf(template, months, now))
     .filter((item): item is DueTemplate<TemplateRow> => item !== null)
     .sort((x, y) => (x.template.id < y.template.id ? -1 : x.template.id > y.template.id ? 1 : 0));
   for (const { template, scheduledMonth, expenseDate } of due) {
-    // 今月が締められていれば、最も古い未締めの月(締めた月の翌月)。未締めの月は連続している(8章)。
-    const targetMonth = latestClosed === null || scheduledMonth > latestClosed ? scheduledMonth : nextMonth(latestClosed);
-    const split = splitFromRows(template.split_method, byTemplate.get(template.id) ?? []);
-    const memberIds = [template.payer_member_id, ...splitMemberRefs(split).map((ref) => ref.id)];
-    // 使えないメンバーがいれば、今回は作らない(記録も残さない)。脱退の確定が済めば、固定費は止まる(`payer_left`・
-    // `member_changed`)。確定のCronより先にここへ来ても、脱退した人の支出を作らない。
-    if (!allAvailable(members, memberIds, targetMonth)) continue;
+    const targetMonth = recurringTargetMonth(scheduledMonth, latestClosed);
+    try {
+      const split = splitFromRows(template.split_method, byTemplate.get(template.id) ?? []);
+      // 負担額は、支出の登録と同じ関数で計算する(金額指定の合計の検査も同じ)。合わなければ、保存した設定の不整合。
+      const built = buildAllocations(template.amount_minor, split);
+      if (!built.ok) throw new Error(`固定費の負担設定が金額と合わない: ${built.field}`);
 
-    const expenseId = crypto.randomUUID();
-    expenses.push([
-      expenseId,
-      groupId,
-      expenseDate,
-      targetMonth,
-      template.description,
-      template.amount_minor,
-      template.category_id,
-      template.payer_member_id,
-      // 自動登録は、誰かが登録したものではない。支払者が登録した扱いにする(登録者は必須の列)。
-      template.payer_member_id,
-      template.split_method,
-      template.id,
-      now,
-      now,
-    ]);
-    if (split.method !== 'category') {
-      const shareOf = new Map(split.method === 'ratio' ? split.shares.map((s) => [s.memberId, s.basisPoints] as const) : []);
-      for (const item of splitExpense(template.amount_minor, split)) {
-        burdens.push([groupId, expenseId, item.memberId, item.amount, shareOf.get(item.memberId) ?? null]);
-      }
+      // 使えないメンバーがいれば、今回は作らない(記録も残さない)。脱退の確定が済めば、固定費は止まる(`payer_left`・
+      // `member_changed`)。確定のCronより先にここへ来ても、脱退した人の支出を作らない。
+      const memberIds = [template.payer_member_id, ...splitMemberRefs(split).map((ref) => ref.id)];
+      if (!allAvailable(members, memberIds, targetMonth)) continue;
+
+      const expenseId = crypto.randomUUID();
+      bundles.push({
+        recurringId: template.id,
+        scheduledMonth,
+        expense: [
+          expenseId,
+          groupId,
+          expenseDate,
+          targetMonth,
+          template.description,
+          template.amount_minor,
+          template.category_id,
+          template.payer_member_id,
+          // 自動登録は、誰かが登録したものではない。支払者が登録した扱いにする(登録者は必須の列)。
+          template.payer_member_id,
+          template.split_method,
+          template.id,
+          now,
+          now,
+        ],
+        burdens: built.allocations.map((item) => [groupId, expenseId, item.memberId, item.burdenMinor, item.shareBasisPoints]),
+        run: [groupId, template.id, scheduledMonth, expenseId, now],
+      });
+    } catch (error) {
+      // 不整合のある固定費だけ飛ばす(ほかの固定費は作る)。値(名前・金額など)はログに出さない。
+      console.error('固定費の自動登録を飛ばした', groupId, template.id, error instanceof Error ? error.name : 'unknown');
+      invalidTemplates.push(template.id);
     }
-    runs.push([groupId, template.id, scheduledMonth, expenseId, now]);
-    attempted.push({ recurringId: template.id, scheduledMonth });
   }
-  if (expenses.length === 0) return { result: 'nothing', createdExpenses: 0, queries };
+  if (bundles.length === 0) return nothing('nothing', invalidTemplates);
 
-  // 書く文の数は、固定費の数にほぼ比例しない(複数行を1文にまとめる)。支出 → 負担額 → 生成記録の順(外部キー)。
+  // 残りの予算に収まる件数だけ作る。1件も収まらなければ、このグループは次の回に回す(読み込みの分だけ使った)。
+  let take = bundles.length;
+  while (take > 0 && queries + writeCost(bundles.slice(0, take)) > queriesLeft) take -= 1;
+  if (take === 0) return nothing('postponed', invalidTemplates, bundles.length);
+  const chosen = bundles.slice(0, take);
+  const remaining = bundles.length - take;
+
+  // 支出 → 負担額 → 生成記録の順(外部キー)。
   let statementCount = 0;
   const written = await writeToGroup(db, groupId, version, (token) => {
     const statements = [
-      ...insertRowsGuarded(db, token, groupId, 'expenses', EXPENSE_COLUMNS, expenses),
-      ...insertRowsGuarded(db, token, groupId, 'expense_allocations', ALLOCATION_COLUMNS, burdens),
-      ...insertRowsGuarded(db, token, groupId, 'recurring_expense_runs', RUN_COLUMNS, runs),
+      ...insertRowsGuarded(db, token, groupId, 'expenses', EXPENSE_COLUMNS, chosen.map((bundle) => bundle.expense)),
+      ...insertRowsGuarded(db, token, groupId, 'expense_allocations', ALLOCATION_COLUMNS, chosen.flatMap((bundle) => bundle.burdens)),
+      ...insertRowsGuarded(db, token, groupId, 'recurring_expense_runs', RUN_COLUMNS, chosen.map((bundle) => bundle.run)),
     ];
     statementCount = statements.length;
     return statements;
   });
   queries += 1 + statementCount; // バージョンを上げる文 + 書く文
 
-  if (written.ok) return { result: 'created', createdExpenses: expenses.length, queries };
-  if (written.reason === 'version') return { result: 'deferred', createdExpenses: 0, queries };
+  if (written.ok) return { result: 'created', createdExpenses: chosen.length, remaining, invalidTemplates, queries };
+  if (written.reason === 'version') return nothing('deferred', invalidTemplates);
 
   // 'unique': 同じ(固定費, 予定の月)の生成記録が**ある**ことを読んで確かめる。無ければ、別の原因(後続のSQLへの
   // GROUP_WRITE_GUARD の付け忘れなど、実装の誤り)なので、作成済みとして正常にせず、エラーにする(7章)。
@@ -262,19 +324,19 @@ async function registerForGroup(db: D1Database, groupId: string, now: number): P
   const found = await db
     .prepare(
       `SELECT count(*) AS n FROM recurring_expense_runs
-        WHERE group_id = ? AND scheduled_month = ? AND recurring_expense_id IN (${attempted.map(() => '?').join(', ')})`,
+        WHERE group_id = ? AND scheduled_month = ? AND recurring_expense_id IN (${chosen.map(() => '?').join(', ')})`,
     )
-    .bind(groupId, attempted[0]!.scheduledMonth, ...attempted.map((item) => item.recurringId))
+    .bind(groupId, chosen[0]!.scheduledMonth, ...chosen.map((bundle) => bundle.recurringId))
     .first<{ n: number }>();
   queries += 1;
   if ((found?.n ?? 0) === 0) throw new Error('固定費の自動登録で、生成記録が無いのに一意制約に違反した');
-  return { result: 'deferred', createdExpenses: 0, queries };
+  return nothing('deferred', invalidTemplates);
 }
 
 /**
  * 固定費の自動登録。`usedQueries` は、この回がすでに使ったD1のクエリ数、`queryBudget` は1回の実行の予算(cron.ts)。
  * 候補を探す1回と、グループごとの書き込みが予算に収まる範囲で、グループのID順に処理する。
- * 予算に収まらないグループは、`postponedGroups` として次の回に回す(1時間後。予定日の当日中に作られる)。
+ * 予算に収まらないグループ(や固定費)は、`postponedGroups` として次の回に回す(1時間後。予定日の当日中に作られる)。
  * 1つのグループの失敗で、ほかのグループを止めない(`failedGroups` に入れる。投げるのは呼び出し側)。
  */
 export async function registerDueRecurring(
@@ -289,6 +351,7 @@ export async function registerDueRecurring(
     deferredGroups: [],
     failedGroups: [],
     postponedGroups: [],
+    invalidTemplates: [],
     skipped: false,
     queries: 0,
   };
@@ -300,27 +363,30 @@ export async function registerDueRecurring(
   const groupIds = await findGroupsWithDueTemplates(db, now);
   summary.queries += 1;
 
-  let largest = 0;
   for (const groupId of groupIds) {
-    if (usedQueries + summary.queries + Math.max(largest, ESTIMATED_QUERIES_PER_RECURRING_GROUP) > queryBudget) {
+    const left = queryBudget - usedQueries - summary.queries;
+    if (left < ESTIMATED_QUERIES_PER_RECURRING_GROUP) {
       summary.postponedGroups.push(groupId);
       continue;
     }
     try {
-      const outcome = await registerForGroup(db, groupId, now);
+      const outcome = await registerForGroup(db, groupId, now, left);
       summary.queries += outcome.queries;
-      largest = Math.max(largest, outcome.queries);
+      summary.invalidTemplates.push(...outcome.invalidTemplates);
       if (outcome.result === 'created') {
         summary.createdGroups.push(groupId);
         summary.createdExpenses += outcome.createdExpenses;
       }
       if (outcome.result === 'deferred') summary.deferredGroups.push(groupId);
+      if (outcome.result === 'postponed' || (outcome.result === 'created' && outcome.remaining > 0)) {
+        summary.postponedGroups.push(groupId);
+      }
     } catch (error) {
       // 値(名前・金額など)はログに出さない。
       console.error('固定費の自動登録に失敗', groupId, error instanceof Error ? error.name : 'unknown');
       summary.failedGroups.push(groupId);
-      // 失敗した分のクエリ数は分からないので、最も大きい1グループと同じだけ使ったものとして、予算を減らす。
-      summary.queries += Math.max(largest, 1);
+      // 失敗した分のクエリ数は分からないので、1グループの最小の費用と同じだけ使ったものとして、予算を減らす。
+      summary.queries += ESTIMATED_QUERIES_PER_RECURRING_GROUP;
     }
   }
   return summary;

@@ -30,7 +30,7 @@ import {
 } from './invites.ts';
 import { handleCancelLeave, handleRequestLeave } from './leave.ts';
 import { isMonth } from './months.ts';
-import { handleCreateRecurring, handleListRecurring, handleUpdateRecurring } from './recurring.ts';
+import { handleCreateRecurring, handleDeleteRecurring, handleListRecurring, handleUpdateRecurring } from './recurring.ts';
 import { handleProcessTransfer } from './transfers.ts';
 
 const GROUPS_PATH = /^\/groups$/;
@@ -160,7 +160,8 @@ export default {
       const recurringId = recurring[1]!;
       if (!isId(recurringId)) return notFound();
       if (request.method === 'PATCH') return handleUpdateRecurring(request, env, now, recurringId);
-      return methodNotAllowed('PATCH');
+      if (request.method === 'DELETE') return handleDeleteRecurring(request, env, now, recurringId);
+      return methodNotAllowed('PATCH, DELETE');
     }
 
     const groupMonth = GROUP_MONTH_PATH.exec(pathname);

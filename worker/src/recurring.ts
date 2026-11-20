@@ -4,9 +4,10 @@
 // 書き込み(登録・変更)は、すべて writeToGroupWithRetry を通す(8章): バージョンを先に読み、そのあとで検証に使う
 // データを読む。読み込みは `plan` の中だけで行う。書くSQLは、すべて GROUP_WRITE_GUARD の条件つき。
 //
-// テンプレートは物理削除しない(作った支出と生成記録が参照する。付録A-4)。「削除」の代わりに、止める(`manual`)・
-// 終了月を決める。アーカイブした費目の固定費は、止めずに、自動登録だけを見送る(`categoryArchived` で知らせる。7章)。
-import { authenticateRequest, canEditGroupSettings, loadGroupAccess } from './access.ts';
+// テンプレートは、一度でも支出を作ったら物理削除しない(作った支出と生成記録が参照する。付録A-4)。代わりに、止める
+// (`manual`)・終了月を決める。一度も作っていないものだけ、削除できる(`DELETE`)。アーカイブした費目の固定費は、止めずに、
+// 自動登録だけを見送る(`categoryArchived` で知らせる。7章)。
+import { authenticateRequest, canEditGroupSettings, latestClosedMonth, loadGroupAccess, type GroupAccess } from './access.ts';
 import {
   buildAllocations,
   checkMembers,
@@ -18,9 +19,9 @@ import {
 } from './expenses.ts';
 import type { SplitInput } from './expenseInput.ts';
 import { GROUP_WRITE_GUARD, insertRowsGuarded, writeToGroupWithRetry } from './groupWrite.ts';
-import { conflict, forbidden, invalidRequest, json, notFound, readJsonObject, unauthorized } from './http.ts';
+import { conflict, forbidden, invalidRequest, json, noContent, notFound, readJsonObject, unauthorized } from './http.ts';
 import { MAX_RECURRING_EXPENSES_PER_GROUP } from './limits.ts';
-import { maxMonth, monthIn } from './months.ts';
+import { dateIn, maxMonth, monthIn, recurringTargetMonth, scheduledDate } from './months.ts';
 import { parseCreateRecurring, parseUpdateRecurring, type UpdateRecurringInput } from './recurringInput.ts';
 
 // 本文の上限。1件の固定費は、メンバーが何人でも数百バイトほど。
@@ -144,6 +145,12 @@ function recurringJson(row: RecurringRow, split: SplitInput) {
 }
 type RecurringJson = ReturnType<typeof recurringJson>;
 
+/** 書き込みの応答。`thisMonthSkipped` は、今月の分を作らない記録を、この書き込みで残したか(アプリが案内する)。 */
+interface WrittenRecurring {
+  recurringExpense: RecurringJson;
+  thisMonthSkipped: boolean;
+}
+
 async function loadRecurringOne(
   db: D1Database,
   groupId: string,
@@ -180,6 +187,47 @@ async function loadCategoryArchived(
 }
 
 const categoryNotAvailable = (): Response => conflict('category_not_available');
+
+/**
+ * 支払者・負担の対象が使えるかを見る月 = 最初に支出を作る月。自動登録(recurringRun.ts)が見る月と同じ決め方にする
+ * (今月を早めに締めていれば、翌月。APIは通すのに、Cronが黙って見送る、を避ける)。
+ */
+async function firstTargetMonth(db: D1Database, access: GroupAccess, startMonth: string, now: number): Promise<string> {
+  const scheduled = maxMonth(startMonth, monthIn(access.group.timezone, now));
+  return recurringTargetMonth(scheduled, await latestClosedMonth(db, access.group.id));
+}
+
+/** 今月の分を、いま作る時期に来ている状態か(止まっていない、開始月〜終了月に今月が入る、予定日を過ぎた)。生成記録は見ない。 */
+function isDueThisMonth(
+  state: { paused_at: number | null; day_of_month: number; start_month: string; end_month: string | null },
+  month: string,
+  today: string,
+): boolean {
+  return (
+    state.paused_at === null &&
+    state.start_month <= month &&
+    (state.end_month === null || month <= state.end_month) &&
+    scheduledDate(month, state.day_of_month) <= today
+  );
+}
+
+const RUN_COLUMNS = ['group_id', 'recurring_expense_id', 'scheduled_month', 'expense_id', 'created_at'];
+
+/**
+ * 今月の分を「作らなかった」記録(生成記録。支出のIDは無し)。登録・再開などで、**新しく**今月の予定日を過ぎた状態に
+ * したとき、すぐに今月の分が作られて、手で入力した分と二重にならないように残す(企画メモ7章「設定変更は原則として
+ * 翌月以降に反映」。7章)。
+ */
+function skipThisMonthStatements(
+  db: D1Database,
+  token: string,
+  groupId: string,
+  recurringId: string,
+  month: string,
+  now: number,
+): D1PreparedStatement[] {
+  return insertRowsGuarded(db, token, groupId, 'recurring_expense_runs', RUN_COLUMNS, [[groupId, recurringId, month, null, now]]);
+}
 
 // ---------------------------------------------------------------------------
 // 書き込みのSQL。すべて GROUP_WRITE_GUARD の条件つき(8章)。
@@ -302,7 +350,7 @@ export async function handleCreateRecurring(
   const input = parsed.value;
   const db = env.DB;
 
-  const outcome = await writeToGroupWithRetry<RecurringJson, Response>(db, groupId, async () => {
+  const outcome = await writeToGroupWithRetry<WrittenRecurring, Response>(db, groupId, async () => {
     const access = await loadGroupAccess(db, session.userId, groupId);
     if (access === null) return { reject: notFound() };
     if (!canEditGroupSettings(access, now)) return { reject: forbidden() };
@@ -339,8 +387,8 @@ export async function handleCreateRecurring(
     if (category === null) return { reject: invalidRequest('categoryId') };
     if (category.archived) return { reject: categoryNotAvailable() };
 
-    // 支払者・負担の対象は、最初に支出を作る月に使えること。開始月が今月より先なら、その月。
-    const checkMonth = maxMonth(input.startMonth, monthIn(access.group.timezone, now));
+    // 支払者・負担の対象は、最初に支出を作る月(自動登録と同じ決め方)に使えること。
+    const checkMonth = await firstTargetMonth(db, access, input.startMonth, now);
     const memberProblem = checkMembers(
       members,
       [
@@ -371,16 +419,20 @@ export async function handleCreateRecurring(
       updated_at: now,
       category_archived_at: null,
     };
+    // 予定日をすぎた状態で作ったときは、今月の分は作らない(来月から)。
+    const thisMonth = monthIn(access.group.timezone, now);
+    const skipThisMonth = isDueThisMonth(row, thisMonth, dateIn(access.group.timezone, now));
     return {
-      value: recurringJson(row, input.split),
+      value: { recurringExpense: recurringJson(row, input.split), thisMonthSkipped: skipThisMonth },
       write: (token) => [
         insertRecurringStatement(db, token, row),
         ...insertRowsGuarded(db, token, groupId, 'recurring_expense_allocations', ALLOCATION_COLUMNS, allocationRowsOf(groupId, row.id, input.split)),
+        ...(skipThisMonth ? skipThisMonthStatements(db, token, groupId, row.id, thisMonth, now) : []),
       ],
     };
   });
 
-  return outcome.status === 'written' ? json({ recurringExpense: outcome.value }, 201) : failureResponse(outcome);
+  return outcome.status === 'written' ? json(outcome.value, 201) : failureResponse(outcome);
 }
 
 // ---------------------------------------------------------------------------
@@ -414,7 +466,7 @@ export async function handleUpdateRecurring(
   const groupId = await findRecurringGroup(db, recurringId);
   if (groupId === null) return notFound();
 
-  const outcome = await writeToGroupWithRetry<RecurringJson, Response>(db, groupId, async () => {
+  const outcome = await writeToGroupWithRetry<WrittenRecurring, Response>(db, groupId, async () => {
     const access = await loadGroupAccess(db, session.userId, groupId);
     if (access === null) return { reject: notFound() };
     const stored = await loadRecurringOne(db, groupId, recurringId);
@@ -436,8 +488,9 @@ export async function handleUpdateRecurring(
       pausedAt = null;
       pausedReason = null;
     }
-    // メンバーが変わって止まったものは、負担の指定を見直して(送り直して)から再開する(企画メモ7章)。
-    if (resuming && current.paused_reason === 'member_changed' && patch.split === undefined) {
+    // `category` 以外の負担の固定費は、負担の指定を見直して(送り直して)から再開する(企画メモ7章)。止まっていた間に
+    // メンバーが変わっても、理由は1つしか持てない(手動で止めたものは `member_changed` にならない)ので、理由によらず求める。
+    if (resuming && current.split_method !== 'category' && patch.split === undefined) {
       return { reject: invalidRequest('split') };
     }
 
@@ -495,21 +548,89 @@ export async function handleUpdateRecurring(
       },
       ...splitMemberRefs(split).map((ref) => ({ ...ref, checkAvailable: resuming || patch.split !== undefined })),
     ];
-    const memberProblem = checkMembers(members, refs, maxMonth(next.start_month, monthIn(access.group.timezone, now)));
+    const memberProblem = checkMembers(members, refs, await firstTargetMonth(db, access, next.start_month, now));
     if (memberProblem !== null) return { reject: memberProblem };
+
+    // 今月の分を、この変更で**新しく**作る時期にしたとき(再開・日を過ぎた日に変更・開始月を今月にした)は、作らない記録を
+    // 残す。もともと作る時期に来ていた(まだCronが作っていないだけ)なら、記録しない(作る分を取り上げない)。
+    const thisMonth = monthIn(access.group.timezone, now);
+    const today = dateIn(access.group.timezone, now);
+    let skipThisMonth = false;
+    if (isDueThisMonth(next, thisMonth, today) && !isDueThisMonth(current, thisMonth, today)) {
+      const ran = await db
+        .prepare('SELECT 1 AS found FROM recurring_expense_runs WHERE recurring_expense_id = ? AND scheduled_month = ?')
+        .bind(recurringId, thisMonth)
+        .first<{ found: number }>();
+      skipThisMonth = ran === null;
+    }
 
     const replaceAllocations = patch.split !== undefined && !(patch.split.method === 'category' && current.split_method === 'category');
     return {
-      value: recurringJson(next, split),
+      value: { recurringExpense: recurringJson(next, split), thisMonthSkipped: skipThisMonth },
       write: (token) => [
         ...(replaceAllocations ? [deleteAllocationsStatement(db, token, groupId, recurringId)] : []),
         updateRecurringStatement(db, token, next),
         ...(replaceAllocations && patch.split !== undefined
           ? insertRowsGuarded(db, token, groupId, 'recurring_expense_allocations', ALLOCATION_COLUMNS, allocationRowsOf(groupId, recurringId, patch.split))
           : []),
+        ...(skipThisMonth ? skipThisMonthStatements(db, token, groupId, recurringId, thisMonth, now) : []),
       ],
     };
   });
 
-  return outcome.status === 'written' ? json({ recurringExpense: outcome.value }) : failureResponse(outcome);
+  return outcome.status === 'written' ? json(outcome.value) : failureResponse(outcome);
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /recurring-expenses/:id
+
+/**
+ * 一度も支出を作っていない(生成記録が無い)固定費だけ、物理削除できる。作った支出と生成記録が参照するので、一度でも
+ * 作った固定費は消せない(止める・終了月を決める)。間違えて作った固定費が、上限(50件)と通貨のロックに残り続けないように。
+ * 生成記録は、支出と同じ書き込みで作る(自動登録)ので、生成記録が無ければ、参照する支出も無い。
+ */
+export async function handleDeleteRecurring(
+  request: Request,
+  env: Env,
+  now: number,
+  recurringId: string,
+): Promise<Response> {
+  const session = await authenticateRequest(request, env.DB, now);
+  if (session === null) return unauthorized();
+  const db = env.DB;
+
+  const groupId = await findRecurringGroup(db, recurringId);
+  if (groupId === null) return notFound();
+
+  const outcome = await writeToGroupWithRetry<null, Response>(db, groupId, async () => {
+    const access = await loadGroupAccess(db, session.userId, groupId);
+    if (access === null) return { reject: notFound() };
+    const [current, run] = await Promise.all([
+      db
+        .prepare('SELECT 1 AS found FROM recurring_expenses WHERE id = ? AND group_id = ?')
+        .bind(recurringId, groupId)
+        .first<{ found: number }>(),
+      db
+        .prepare('SELECT 1 AS found FROM recurring_expense_runs WHERE recurring_expense_id = ? LIMIT 1')
+        .bind(recurringId)
+        .first<{ found: number }>(),
+    ]);
+    if (current === null) return { reject: notFound() };
+    if (!canEditGroupSettings(access, now)) return { reject: forbidden() };
+    // 自動登録が、読んだあとに作れば、バージョンが上がっていて、ここに来ない(競合として、読み直して判定し直す)。
+    if (run !== null) return { reject: conflict('recurring_expense_in_use') };
+
+    return {
+      value: null,
+      // 負担設定(子)から先に消す。
+      write: (token) => [
+        deleteAllocationsStatement(db, token, groupId, recurringId),
+        db
+          .prepare(`DELETE FROM recurring_expenses WHERE id = ? AND group_id = ? AND EXISTS (${GROUP_WRITE_GUARD})`)
+          .bind(recurringId, groupId, groupId, token),
+      ],
+    };
+  });
+
+  return outcome.status === 'written' ? noContent() : failureResponse(outcome);
 }

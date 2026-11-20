@@ -102,3 +102,12 @@ export function daysInMonth(month: string): number {
 export function scheduledDate(month: string, dayOfMonth: number): string {
   return `${month}-${String(Math.min(dayOfMonth, daysInMonth(month))).padStart(2, '0')}`;
 }
+
+/**
+ * 固定費の予定の月に作った支出の登録先の月（docs/backend-design.md 7章）。予定の月が未締めならその月。早めに締められて
+ * いれば、最も古い未締めの月（締めた月の翌月。未締めの月は連続している）。自動登録（Cron）と、固定費のAPIが
+ * 「その月に使えるメンバーか」を見る月とで、同じ決め方を使う。
+ */
+export function recurringTargetMonth(scheduledMonth: string, latestClosedMonth: string | null): string {
+  return latestClosedMonth === null || scheduledMonth > latestClosedMonth ? scheduledMonth : nextMonth(latestClosedMonth);
+}
