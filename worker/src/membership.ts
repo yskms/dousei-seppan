@@ -4,7 +4,7 @@
 //
 // ここの `...Statements` は、どれも GROUP_WRITE_GUARD の条件つき（8章）。`writeToGroup` の build の中で呼ぶ。
 // 読み込み（`loadMembers`・`loadCategoryIds`）は、バージョンを読んだあとに呼ぶ（groupWrite.ts 冒頭の注意1）。
-import { latestClosedMonth, participatesInMonth } from './access.ts';
+import { isLeaveEffectiveFor, latestClosedMonth, participatesInMonth } from './access.ts';
 import { markLeftStatement } from './closedMonth.ts';
 import { GROUP_WRITE_GUARD, insertRowsGuarded, readDataVersion, writeToGroup } from './groupWrite.ts';
 import type { MemberInfo } from './monthState.ts';
@@ -53,6 +53,15 @@ export async function loadMembers(db: D1Database, groupId: string): Promise<Memb
     expenseEndMonth: row.expense_end_month,
     leaveRequestedMonth: row.leave_requested_month,
   }));
+}
+
+/**
+ * 人数の上限（`MAX_MEMBERS_PER_GROUP`）で数える、今月以降もグループにいるメンバーの数。脱退が確定した（`leaving`
+ * 以降）・脱退月が終わった（Cronの確定の前でも）人は数えない（入れ替わりの参加をふさがない）。脱退を選んだだけで、
+ * 脱退月がまだ終わっていない人は、今月はいるので数える。判定は access.ts の `isLeaveEffectiveFor` と同じ。
+ */
+export function countSeatedMembers(members: readonly MemberInfo[], timezone: string, now: number): number {
+  return members.filter((member) => !isLeaveEffectiveFor(member, timezone, now)).length;
 }
 
 /** グループの全費目のID（アーカイブ済みも含む）。 */

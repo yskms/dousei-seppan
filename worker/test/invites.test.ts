@@ -8,6 +8,8 @@ import { after, before, describe, it } from 'node:test';
 import { deleteAccount } from '../src/accountDeletion.ts';
 import worker from '../src/index.ts';
 import { INVITE_TTL_MS, MAX_UNUSED_INVITES_PER_MEMBER } from '../src/invites.ts';
+import { MAX_MEMBERS_PER_GROUP } from '../src/limits.ts';
+import { MEMBER_COLORS, pickMemberColor } from '../src/membership.ts';
 import {
   createFixtureFactory,
   equalShares,
@@ -178,6 +180,16 @@ describe('招待・参加のAPI', () => {
       assert.deepEqual([over.status, over.body], [409, { error: 'too_many_invites' }]);
       // 上限はメンバーごと。
       assert.equal((await api.createInvite(bob, g.groupId)).status, 201);
+    });
+
+    it(`人数の上限（${MAX_MEMBERS_PER_GROUP}人）: 参加中が上限なら、発行は409 group_full。脱退が確定した人は数えない`, async () => {
+      const g = await setup();
+      for (const name of ['carol', 'dave']) await factory.addPerson(g.groupId, name);
+      const leaving = await factory.addPerson(g.groupId, 'erin', { status: 'leaving', leaveRequestedMonth: '2026-10', expenseEndMonth: '2026-10' });
+      assert.equal((await api.createInvite(g.people.alice, g.groupId)).status, 201, '数えるのは4人');
+      await db.prepare(`UPDATE group_members SET status = 'active', leave_requested_month = NULL, expense_end_month = NULL WHERE id = ?`).bind(leaving.memberId).run();
+      const over = await api.createInvite(g.people.alice, g.groupId);
+      assert.deepEqual([over.status, over.body], [409, { error: 'group_full' }]);
     });
 
     it('競合: 読んだあとに別の書き込みが入っても、1回だけやり直して成功する。続けて競合したら409', async () => {
@@ -588,20 +600,65 @@ describe('招待・参加のAPI', () => {
       assert.equal((await memberRows(g.groupId)).filter((row) => row.user_id === visitor.userId).length, 1);
     });
 
-    it('色: 他のメンバーと重ならないように選ぶ。全色が使われていれば、使われている数で一巡する', async () => {
+    it('色: 他の参加中のメンバーと重ならない最初の色を選ぶ', async () => {
       const g = await setup();
-      const used = ['pink', 'red', 'orange', 'yellow', 'green', 'teal', 'blue', 'purple', 'brown', 'gray'];
-      for (const [index, color] of used.entries()) {
-        const p = await factory.addPerson(g.groupId, `m${index}`);
-        await db.prepare('UPDATE group_members SET color = ? WHERE id = ?').bind(color, p.memberId).run();
-      }
-      await db.prepare(`UPDATE group_members SET color = 'pink' WHERE id IN (?, ?)`).bind(g.people.alice.memberId, g.people.bob.memberId).run();
+      // 参加中4人（上限の1つ手前）で、pink・red・orange を使っている。脱退済みの人の色は、空いているものとして扱う。
+      const carol = await factory.addPerson(g.groupId, 'carol');
+      const dave = await factory.addPerson(g.groupId, 'dave');
+      const gone = await factory.addPerson(g.groupId, 'gone', { status: 'left', leaveRequestedMonth: '2026-10', expenseEndMonth: '2026-10' });
+      const colorOf = async (memberId: string, color: string) =>
+        db.prepare('UPDATE group_members SET color = ? WHERE id = ?').bind(color, memberId).run();
+      await colorOf(g.people.alice.memberId, 'pink');
+      await colorOf(g.people.bob.memberId, 'red');
+      await colorOf(carol.memberId, 'orange');
+      await colorOf(dave.memberId, 'pink');
+      await colorOf(gone.memberId, 'yellow');
       const invite = await insertInviteRow(db, { groupId: g.groupId, invitedByMemberId: g.people.alice.memberId });
       const result = await api.join(await outsider('visitor'), invite.token);
       assert.equal(result.status, 201);
       const added = (await memberRows(g.groupId)).find((row) => row.id === result.body.memberId)!;
-      // 参加中は12人で全色が使われている。12 % 10 = 2 番目の色。
-      assert.equal(added.color, used[2]);
+      assert.equal(added.color, 'yellow');
+    });
+
+    it('色: 全色が使われていれば、使われている数で一巡する（人数の上限の下では起きないが、関数としての規則）', () => {
+      assert.equal(pickMemberColor([...MEMBER_COLORS, 'pink', 'red'], null), MEMBER_COLORS[2]);
+      assert.equal(pickMemberColor(['pink'], 'teal'), 'teal', '前の色が空いていれば、それを使う');
+    });
+
+    it(`人数の上限（${MAX_MEMBERS_PER_GROUP}人）: 参加中が上限なら、参加は409 group_full。何も書かれない`, async () => {
+      const g = await setup();
+      for (const name of ['carol', 'dave', 'erin']) await factory.addPerson(g.groupId, name);
+      const invite = await insertInviteRow(db, { groupId: g.groupId, invitedByMemberId: g.people.alice.memberId });
+      const before = await dataVersion(g.groupId);
+      const result = await api.join(await outsider('visitor'), invite.token);
+      assert.deepEqual([result.status, result.body], [409, { error: 'group_full' }]);
+      assert.equal(await dataVersion(g.groupId), before);
+      assert.equal((await inviteRow(invite.id))!.consumed_at, null, '招待は使われない');
+    });
+
+    it('人数の上限: 脱退が確定した人・脱退月が終わった人・脱退済み・削除済みは数えない。脱退を選んだだけ（今月で抜ける）の人は数える', async () => {
+      const g = await setup();
+      await factory.addPerson(g.groupId, 'carol', { status: 'leaving', leaveRequestedMonth: '2026-10', expenseEndMonth: '2026-10' });
+      await factory.addPerson(g.groupId, 'dave', { leaveRequestedMonth: '2026-10' }); // 脱退月が終わった（Cronの確定の前）
+      await factory.addPerson(g.groupId, 'left1', { status: 'left', leaveRequestedMonth: '2026-10', expenseEndMonth: '2026-10' });
+      await factory.addMember(g.groupId, 'deleted1', null, { status: 'deleted' });
+      await factory.addPerson(g.groupId, 'erin');
+      await factory.addPerson(g.groupId, 'frank', { leaveRequestedMonth: '2026-11' }); // 今月で抜ける。今月はいる
+      // 数えるのは alice・bob・erin・frank の4人。あと1人は参加できる。
+      const first = await insertInviteRow(db, { groupId: g.groupId, invitedByMemberId: g.people.alice.memberId });
+      assert.equal((await api.join(await outsider('visitor1'), first.token)).status, 201);
+      const second = await insertInviteRow(db, { groupId: g.groupId, invitedByMemberId: g.people.alice.memberId });
+      assert.equal((await api.join(await outsider('visitor2'), second.token)).status, 409);
+    });
+
+    it('人数の上限: 脱退した人（left）の復帰も、上限を超えるなら断る', async () => {
+      const g = await setup();
+      for (const name of ['carol', 'dave', 'erin']) await factory.addPerson(g.groupId, name);
+      const back = await factory.addPerson(g.groupId, 'back', { status: 'left', leaveRequestedMonth: '2026-10', expenseEndMonth: '2026-10' });
+      const invite = await insertInviteRow(db, { groupId: g.groupId, invitedByMemberId: g.people.alice.memberId });
+      const result = await api.join(back, invite.token);
+      assert.deepEqual([result.status, result.body], [409, { error: 'group_full' }]);
+      assert.equal((await memberRows(g.groupId)).find((row) => row.id === back.memberId)!.status, 'left');
     });
   });
 });

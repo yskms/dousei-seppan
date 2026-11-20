@@ -16,6 +16,14 @@ export const MAX_GROUP_NAME_LENGTH = 30;
 export const MAX_CATEGORY_NAME_LENGTH = 20;
 
 /**
+ * 1つのグループの人数（今月以降もいるメンバー。脱退が確定した・脱退月が終わった人は数えない。membership.ts の
+ * `countSeatedMembers`）。同棲・夫婦の2人が基本で、ルームシェアの3〜4人までを想定する。月締め・自動登録のD1の
+ * クエリ数と、精算の送金の件数は、人数で増える（docs/backend-design.md 5章。月締めは、6人で実測している）。
+ * 超えると、招待の発行と参加を 409 `group_full` で断る。上げるときは、月締めと自動登録のクエリ数を測り直す。
+ */
+export const MAX_MEMBERS_PER_GROUP = 5;
+
+/**
  * 1つのグループが持てる費目の数（アーカイブ済みを含む）。仮の値。月締めの書き込みは費目の数に応じて増える
  * （docs/backend-design.md 9章。費目30・メンバー6で、前の月の行を引き継ぐ月（よくある月）の月締めは実測47でFreeの上限（50）に
  * ぎりぎり収まるが、脱退の確定を含む月締めは65（締める月に行がある月でも53）で超える。公開前にPaidへ移す前提。
