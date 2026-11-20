@@ -9,7 +9,7 @@
 import {
   authenticateRequest,
   canEditGroupSettings,
-  isLeaveEffectiveFor,
+  canIssueInvitesFor,
   loadGroupAccess,
 } from './access.ts';
 import { minorUnitOf } from './currencies.ts';
@@ -23,7 +23,7 @@ import {
 import { conflict, forbidden, invalidRequest, json, notFound, readJsonObject, unauthorized } from './http.ts';
 import { MAX_MEMBERS_PER_GROUP } from './limits.ts';
 import { parseUpdateMe } from './memberInput.ts';
-import { countSeatedMembers, pickMemberColor } from './membership.ts';
+import { countSeatedMembers, isGroupFull, pickMemberColor } from './membership.ts';
 import { monthIn } from './months.ts';
 import { BASIS_POINTS_TOTAL } from './settlement.ts';
 
@@ -125,12 +125,9 @@ async function loadGroupDetail(db: D1Database, userId: string, groupId: string, 
   if (me === undefined) return null;
   // 人数の上限(`MAX_MEMBERS_PER_GROUP`)で数える人数と、いま招待を発行できるか。アプリが、満員の判定を書き写さないように
   // 返す(脱退月が終わった直後の、Cronの確定の前は、メンバーの状態だけでは分からない)。招待の発行(invites.ts)と同じ判定。
-  const seatedMembers = countSeatedMembers(
-    memberRows.map((row) => ({ status: row.status, leaveRequestedMonth: row.leave_requested_month })),
-    groupRow.timezone,
-    now,
-  );
-  const meCanIssue = !isLeaveEffectiveFor(
+  const seats = memberRows.map((row) => ({ status: row.status, leaveRequestedMonth: row.leave_requested_month }));
+  const seatedMembers = countSeatedMembers(seats, groupRow.timezone, now);
+  const meCanIssue = canIssueInvitesFor(
     { status: me.status, leaveRequestedMonth: me.leave_requested_month },
     groupRow.timezone,
     now,
@@ -141,7 +138,7 @@ async function loadGroupDetail(db: D1Database, userId: string, groupId: string, 
     seatedMembers,
     maxMembers: MAX_MEMBERS_PER_GROUP,
     // 未使用の招待の上限(`too_many_invites`)は含まない(自分の招待の一覧で分かる)。
-    canInvite: meCanIssue && seatedMembers < MAX_MEMBERS_PER_GROUP,
+    canInvite: meCanIssue && !isGroupFull(seats, groupRow.timezone, now),
     members: memberRows.map((row) => memberJson(row, userId)),
     // 通貨を変えられないか（`PATCH` が 409 `currency_locked` を返す条件）。画面が、変更の入口を出すかを決めるため。
     currencyLocked: (locked.results[0] as { locked: number } | undefined)?.locked === 1,

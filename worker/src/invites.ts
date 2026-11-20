@@ -25,11 +25,10 @@ import {
   writeToGroupWithRetry,
 } from './groupWrite.ts';
 import { conflict, forbidden, invalidRequest, json, noContent, notFound, readJsonObject, unauthorized } from './http.ts';
-import { MAX_MEMBERS_PER_GROUP } from './limits.ts';
 import { parseJoin } from './memberInput.ts';
 import {
-  countSeatedMembers,
   firstResettableMonth,
+  isGroupFull,
   loadCategoryIds,
   loadMembers,
   loadRuleMonthsAfter,
@@ -85,9 +84,7 @@ export async function handleCreateInvite(request: Request, env: Env, now: number
     if ((unused?.n ?? 0) >= MAX_UNUSED_INVITES_PER_MEMBER) return { reject: conflict('too_many_invites') };
     // 人数が上限なら、招待しても参加できない。発行の時点で断る（参加でも、もう一度見る）。
     const members = await loadMembers(db, groupId);
-    if (countSeatedMembers(members, access.group.timezone, now) >= MAX_MEMBERS_PER_GROUP) {
-      return { reject: groupFull() };
-    }
+    if (isGroupFull(members, access.group.timezone, now)) return { reject: groupFull() };
     return {
       write: (writeToken: string) =>
         insertRowsGuarded(
@@ -268,7 +265,7 @@ export async function handleGetInvite(request: Request, env: Env, now: number, t
     groupName: invite.group_name,
     invitedByDisplayName: invite.inviter_name,
     expiresAt: invite.expires_at,
-    groupFull: countSeatedMembers(members, invite.timezone, now) >= MAX_MEMBERS_PER_GROUP,
+    groupFull: isGroupFull(members, invite.timezone, now),
   });
 }
 
@@ -314,7 +311,7 @@ export async function handleJoin(request: Request, env: Env, now: number, token:
 
   const members = await loadMembers(db, groupId);
   // 人数の上限（発行のあとに、ほかの招待で埋まったとき）。参加する本人は、まだ数えに入っていない（未参加か `left`）。
-  if (countSeatedMembers(members, invite.timezone, now) >= MAX_MEMBERS_PER_GROUP) return groupFull();
+  if (isGroupFull(members, invite.timezone, now)) return groupFull();
   const categoryIds = await loadCategoryIds(db, groupId);
   const latestClosed = await latestClosedMonth(db, groupId);
 

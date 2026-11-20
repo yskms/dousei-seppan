@@ -7,6 +7,7 @@
 import { isLeaveEffectiveFor, latestClosedMonth, participatesInMonth } from './access.ts';
 import { markLeftStatement } from './closedMonth.ts';
 import { GROUP_WRITE_GUARD, insertRowsGuarded, readDataVersion, writeToGroup } from './groupWrite.ts';
+import { MAX_MEMBERS_PER_GROUP } from './limits.ts';
 import type { MemberInfo } from './monthState.ts';
 import { monthIn, nextMonth } from './months.ts';
 import { allocateEqually, BASIS_POINTS_TOTAL } from './settlement.ts';
@@ -66,6 +67,18 @@ export function countSeatedMembers(
   now: number,
 ): number {
   return members.filter((member) => !isLeaveEffectiveFor(member, timezone, now)).length;
+}
+
+/**
+ * グループの人数が上限（`MAX_MEMBERS_PER_GROUP`）か。招待の発行・参加・招待内容の確認・グループ情報の `canInvite` が
+ * 同じ判定を使う（数え方や上限の条件を変えるときに、表示と実際の判定が食い違わない）。
+ */
+export function isGroupFull(
+  members: readonly { status: string; leaveRequestedMonth: string | null }[],
+  timezone: string,
+  now: number,
+): boolean {
+  return countSeatedMembers(members, timezone, now) >= MAX_MEMBERS_PER_GROUP;
 }
 
 /** グループの全費目のID（アーカイブ済みも含む）。 */

@@ -146,7 +146,19 @@ export function canEditGroupSettings(access: GroupAccess, now: number): boolean 
 
 /** 招待を発行してよいか。`leaving` 以降（脱退が確定したものとして扱うメンバーを含む）は発行できない（5章「招待の取り消し」）。 */
 export function canIssueInvites(access: GroupAccess, now: number): boolean {
-  return !isLeaveEffective(access, now);
+  return canIssueInvitesFor(access.member, access.group.timezone, now);
+}
+
+/**
+ * `canIssueInvites` の中身。`GroupAccess` を持たない呼び出し（グループ情報の `canInvite`。groups.ts）が、招待の発行と
+ * **同じ**規則を使うための関数。発行の条件を足すときは、ここに足す（表示と実際の判定が食い違わない）。
+ */
+export function canIssueInvitesFor(
+  member: { status: string; leaveRequestedMonth: string | null },
+  timezone: string,
+  now: number,
+): boolean {
+  return !isLeaveEffectiveFor(member, timezone, now);
 }
 
 /** 最後に締めた月。まだ締めていなければ null。 */
