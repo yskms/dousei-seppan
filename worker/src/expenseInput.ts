@@ -30,6 +30,12 @@ export interface CreateExpenseInput {
   categoryId: string;
   payerMemberId: string;
   split: SplitInput;
+  /**
+   * 金額を入力したときの通貨(アプリが、グループ情報で知っている通貨)。グループの通貨と違えば409 `currency_mismatch`。
+   * 金額は通貨の最小単位の整数なので、通貨を変えた直後に、古い通貨の画面から送られた金額が、別の額として保存されるのを防ぐ。
+   * 無ければ検査しない(アプリは必ず送る。docs/backend-design.md 2章)。
+   */
+  currencyCode: string | null;
 }
 
 /** 編集。無い項目は変えない。`description` は null で消す。 */
@@ -41,6 +47,8 @@ export interface UpdateExpenseInput {
   categoryId?: string;
   payerMemberId?: string;
   split?: SplitInput;
+  /** 登録と同じ。金額(`amountMinor`・`split`)を送るときに添える。 */
+  currencyCode?: string;
 }
 
 /** 失敗は、直すべき項目の名前。本文全体の不備（空の本文）で項目を特定できないときは空文字。 */
@@ -61,19 +69,19 @@ export function isUuid(value: unknown): value is string {
 
 const fail = (field: string): { ok: false; field: string } => ({ ok: false, field });
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 /** 許す項目以外があれば、その名前を返す。 */
-function unknownKey(record: Record<string, unknown>, allowed: readonly string[], prefix = ''): string | null {
+export function unknownKey(record: Record<string, unknown>, allowed: readonly string[], prefix = ''): string | null {
   for (const key of Object.keys(record)) {
     if (!allowed.includes(key)) return `${prefix}${key}`;
   }
   return null;
 }
 
-function codePointLength(text: string): number {
+export function codePointLength(text: string): number {
   let length = 0;
   for (const _ of text) length += 1;
   return length;
@@ -153,6 +161,9 @@ function parseSplit(value: unknown): ParseResult<SplitInput> {
   }
 }
 
+// 通貨コードの形だけを見る(選べる通貨かは見ない。グループの通貨と合うかは、呼び出し側が見る)。
+export const isCurrencyCodeShape = (value: unknown): value is string => typeof value === 'string' && /^[A-Z]{3}$/.test(value);
+
 const EXPENSE_KEYS = [
   'expenseDate',
   'targetMonth',
@@ -161,6 +172,7 @@ const EXPENSE_KEYS = [
   'categoryId',
   'payerMemberId',
   'split',
+  'currencyCode',
 ] as const;
 
 // 登録だけが `id` を受け取る。編集（PATCH）で支出のIDは変えられない。
@@ -179,9 +191,11 @@ export function parseCreateExpense(body: Record<string, unknown>): ParseResult<C
   if (!isId(body.payerMemberId)) return fail('payerMemberId');
   const split = parseSplit(body.split);
   if (!split.ok) return split;
+  if (body.currencyCode !== undefined && !isCurrencyCodeShape(body.currencyCode)) return fail('currencyCode');
   return {
     ok: true,
     value: {
+      currencyCode: body.currencyCode === undefined ? null : body.currencyCode,
       id: body.id === undefined ? null : body.id,
       expenseDate: body.expenseDate,
       targetMonth: body.targetMonth,
@@ -228,6 +242,10 @@ export function parseUpdateExpense(body: Record<string, unknown>): ParseResult<U
     const split = parseSplit(body.split);
     if (!split.ok) return split;
     value.split = split.value;
+  }
+  if (body.currencyCode !== undefined) {
+    if (!isCurrencyCodeShape(body.currencyCode)) return fail('currencyCode');
+    value.currencyCode = body.currencyCode;
   }
   return { ok: true, value };
 }

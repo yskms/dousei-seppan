@@ -136,6 +136,14 @@ export function canWriteExpenses(access: GroupAccess, now: number): boolean {
   return !isLeaveEffective(access, now);
 }
 
+/**
+ * グループの設定（グループ名・通貨、費目、月ごとの負担割合）を変えてよいか。支出の記録と同じで、脱退が確定した
+ * （確定したものとして扱う月の終わりを含む）メンバーは変えられない（5章）。全メンバーが変えられる（企画メモ4章）。
+ */
+export function canEditGroupSettings(access: GroupAccess, now: number): boolean {
+  return !isLeaveEffective(access, now);
+}
+
 /** 招待を発行してよいか。`leaving` 以降（脱退が確定したものとして扱うメンバーを含む）は発行できない（5章「招待の取り消し」）。 */
 export function canIssueInvites(access: GroupAccess, now: number): boolean {
   return !isLeaveEffective(access, now);

@@ -1,8 +1,23 @@
 // 入口。エンドポイントは docs/backend-design.md 9章の順に足す。
+import {
+  handleCreateCategory,
+  handleGetCategoryRules,
+  handleListCategories,
+  handlePutCategoryRule,
+  handleReorderCategories,
+  handleUpdateCategory,
+} from './categories.ts';
 import { handleCloseMonth, handleGetClosing, handleMonthSummary } from './closings.ts';
 import { runScheduled } from './cron.ts';
 import { isId } from './expenseInput.ts';
 import { handleCreateExpense, handleDeleteExpense, handleListExpenses, handleUpdateExpense } from './expenses.ts';
+import {
+  handleCreateGroup,
+  handleGetGroup,
+  handleListGroups,
+  handleUpdateGroup,
+  handleUpdateMe,
+} from './groups.ts';
 import { methodNotAllowed, notFound } from './http.ts';
 import { httpsRequiredResponse, isInsecureRequest } from './https.ts';
 import {
@@ -17,6 +32,14 @@ import { handleCancelLeave, handleRequestLeave } from './leave.ts';
 import { isMonth } from './months.ts';
 import { handleProcessTransfer } from './transfers.ts';
 
+const GROUPS_PATH = /^\/groups$/;
+const GROUP_PATH = /^\/groups\/([^/]+)$/;
+const GROUP_ME_PATH = /^\/groups\/([^/]+)\/members\/me$/;
+const GROUP_CATEGORIES_PATH = /^\/groups\/([^/]+)\/categories$/;
+const GROUP_CATEGORIES_ORDER_PATH = /^\/groups\/([^/]+)\/categories\/order$/;
+const CATEGORY_PATH = /^\/categories\/([^/]+)$/;
+const GROUP_CATEGORY_RULES_PATH = /^\/groups\/([^/]+)\/months\/([^/]+)\/category-shares$/;
+const GROUP_CATEGORY_RULE_PATH = /^\/groups\/([^/]+)\/months\/([^/]+)\/category-shares\/([^/]+)$/;
 const GROUP_EXPENSES_PATH = /^\/groups\/([^/]+)\/expenses$/;
 const EXPENSE_PATH = /^\/expenses\/([^/]+)$/;
 const GROUP_MONTH_PATH = /^\/groups\/([^/]+)\/months\/([^/]+)\/(summary|close|closing)$/;
@@ -34,6 +57,73 @@ export default {
 
     const { pathname } = new URL(request.url);
     const now = Date.now();
+
+    if (GROUPS_PATH.test(pathname)) {
+      if (request.method === 'GET') return handleListGroups(request, env, now);
+      if (request.method === 'POST') return handleCreateGroup(request, env, now);
+      return methodNotAllowed('GET, POST');
+    }
+
+    const group = GROUP_PATH.exec(pathname);
+    if (group !== null) {
+      const groupId = group[1]!;
+      if (!isId(groupId)) return notFound();
+      if (request.method === 'GET') return handleGetGroup(request, env, now, groupId);
+      if (request.method === 'PATCH') return handleUpdateGroup(request, env, now, groupId);
+      return methodNotAllowed('GET, PATCH');
+    }
+
+    const groupMe = GROUP_ME_PATH.exec(pathname);
+    if (groupMe !== null) {
+      const groupId = groupMe[1]!;
+      if (!isId(groupId)) return notFound();
+      if (request.method === 'PATCH') return handleUpdateMe(request, env, now, groupId);
+      return methodNotAllowed('PATCH');
+    }
+
+    const groupCategories = GROUP_CATEGORIES_PATH.exec(pathname);
+    if (groupCategories !== null) {
+      const groupId = groupCategories[1]!;
+      if (!isId(groupId)) return notFound();
+      if (request.method === 'GET') return handleListCategories(request, env, now, groupId);
+      if (request.method === 'POST') return handleCreateCategory(request, env, now, groupId);
+      return methodNotAllowed('GET, POST');
+    }
+
+    const categoriesOrder = GROUP_CATEGORIES_ORDER_PATH.exec(pathname);
+    if (categoriesOrder !== null) {
+      const groupId = categoriesOrder[1]!;
+      if (!isId(groupId)) return notFound();
+      if (request.method === 'PUT') return handleReorderCategories(request, env, now, groupId);
+      return methodNotAllowed('PUT');
+    }
+
+    const category = CATEGORY_PATH.exec(pathname);
+    if (category !== null) {
+      const categoryId = category[1]!;
+      if (!isId(categoryId)) return notFound();
+      if (request.method === 'PATCH') return handleUpdateCategory(request, env, now, categoryId);
+      return methodNotAllowed('PATCH');
+    }
+
+    const categoryRules = GROUP_CATEGORY_RULES_PATH.exec(pathname);
+    if (categoryRules !== null) {
+      const groupId = categoryRules[1]!;
+      const month = categoryRules[2]!;
+      if (!isId(groupId) || !isMonth(month)) return notFound();
+      if (request.method === 'GET') return handleGetCategoryRules(request, env, now, groupId, month);
+      return methodNotAllowed('GET');
+    }
+
+    const categoryRule = GROUP_CATEGORY_RULE_PATH.exec(pathname);
+    if (categoryRule !== null) {
+      const groupId = categoryRule[1]!;
+      const month = categoryRule[2]!;
+      const categoryId = categoryRule[3]!;
+      if (!isId(groupId) || !isMonth(month) || !isId(categoryId)) return notFound();
+      if (request.method === 'PUT') return handlePutCategoryRule(request, env, now, groupId, month, categoryId);
+      return methodNotAllowed('PUT');
+    }
 
     const groupExpenses = GROUP_EXPENSES_PATH.exec(pathname);
     if (groupExpenses !== null) {

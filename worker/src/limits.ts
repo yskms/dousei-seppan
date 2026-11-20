@@ -8,3 +8,17 @@ export const MAX_DESCRIPTION_LENGTH = 100;
 
 /** メンバーの表示名の最大文字数（Unicodeのコードポイント数。DDLの `group_members.display_name` のCHECKと同じ）。 */
 export const MAX_DISPLAY_NAME_LENGTH = 20;
+
+/** グループ名の最大文字数（コードポイント数。DDLの `expense_groups.name` のCHECKと同じ）。 */
+export const MAX_GROUP_NAME_LENGTH = 30;
+
+/** 費目の名前の最大文字数（コードポイント数。DDLの `categories.name` のCHECKと同じ）。 */
+export const MAX_CATEGORY_NAME_LENGTH = 20;
+
+/**
+ * 1つのグループが持てる費目の数（アーカイブ済みを含む）。仮の値。月締めの書き込みは費目の数に応じて増える
+ * （docs/backend-design.md 9章。費目30・メンバー6で、前の月の行を引き継ぐ月（よくある月）の月締めは実測47でFreeの上限（50）に
+ * ぎりぎり収まるが、脱退の確定を含む月締めは65（締める月に行がある月でも53）で超える。公開前にPaidへ移す前提。
+ * 上限やメンバー数を増やすときは、worker/test/closings.test.ts の「費目の上限(30)・メンバー6人」を測り直す）。
+ */
+export const MAX_CATEGORIES_PER_GROUP = 30;

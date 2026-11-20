@@ -12,6 +12,7 @@ import {
 } from '../src/expenses.ts';
 import worker from '../src/index.ts';
 import { createFixtureFactory, insertClosing, insertExpenseRow, NOW, type Fixture, type Person } from './apiFixture.ts';
+import { groupsApi } from './groupsApi.ts';
 import { openLocalDatabase, type LocalDatabase } from './localDatabase.ts';
 import { interferingEnv } from './monthApi.ts';
 
@@ -828,6 +829,68 @@ describe('支出のAPI', () => {
   });
 
   // === 編集 ====================================================================================
+
+  // 金額は通貨の最小単位の整数。通貨を変えた直後に、古い通貨の画面から送られた金額が、別の額として保存されない
+  // ようにする(2章)。`currencyCode` は任意で、送ったときだけ、グループの通貨と突き合わせる。
+  describe('グループの通貨との突き合わせ（currencyCode）', () => {
+    it('通貨が合えば登録できる。送らなければ検査しない。形が違えば400', async () => {
+      const f = await createFixture();
+      assert.equal((await create(f, f.alice, body(f, { currencyCode: 'JPY' }))).status, 201);
+      assert.equal((await create(f, f.alice, body(f))).status, 201);
+      for (const currencyCode of ['jpy', 'JP', 1, null]) {
+        assert.deepEqual(await create(f, f.alice, body(f, { currencyCode })), {
+          status: 400,
+          body: { error: 'invalid_request', field: 'currencyCode' },
+        });
+      }
+    });
+
+    it('グループの通貨と違えば409 currency_mismatch(グループの通貨を添える)で、何も書かない', async () => {
+      const f = await createFixture();
+      const versionBefore = await dataVersion(f.groupId);
+      const result = await create(f, f.alice, body(f, { currencyCode: 'USD' }));
+      assert.deepEqual(result, { status: 409, body: { error: 'currency_mismatch', currencyCode: 'JPY' } });
+      assert.equal(await expenseCount(f.groupId), 0);
+      assert.equal(await dataVersion(f.groupId), versionBefore);
+    });
+
+    it('通貨を変えた直後に、古い通貨の画面から送られた登録は、断られる(別の額として保存されない)', async () => {
+      const f = await createFixture();
+      const groups = groupsApi(env);
+      assert.equal((await groups.updateGroup(f.bob, f.groupId, { currencyCode: 'USD' })).status, 200);
+      // 古い画面は JPY のつもりで 1000 を送る。そのまま保存すると、10.00 USD になる。
+      assert.deepEqual(await create(f, f.alice, body(f, { amountMinor: 1000, currencyCode: 'JPY' })), {
+        status: 409,
+        body: { error: 'currency_mismatch', currencyCode: 'USD' },
+      });
+      assert.equal(await expenseCount(f.groupId), 0);
+      // グループ情報を読み直して、USD で入れ直せば登録できる。
+      assert.equal((await create(f, f.alice, body(f, { amountMinor: 1000, currencyCode: 'USD' }))).status, 201);
+    });
+
+    it('同じ id の再送は、通貨の突き合わせより前に判定する(保存済みの支出を返す)', async () => {
+      const f = await createFixture();
+      const id = crypto.randomUUID();
+      assert.equal((await create(f, f.alice, body(f, { id, currencyCode: 'JPY' }))).status, 201);
+      const again = await create(f, f.alice, body(f, { id, currencyCode: 'USD' }));
+      assert.equal(again.status, 200);
+      assert.equal(again.body.expense.id, id);
+    });
+
+    it('編集でも突き合わせる(違えば409で、何も変えない)', async () => {
+      const f = await createFixture();
+      const id = await register(f);
+      const versionBefore = await dataVersion(f.groupId);
+      assert.deepEqual(await update(f.alice, id, { amountMinor: 9999, currencyCode: 'USD' }), {
+        status: 409,
+        body: { error: 'currency_mismatch', currencyCode: 'JPY' },
+      });
+      assert.equal((await expenseRow(id))!.amount_minor, 4280);
+      assert.equal(await dataVersion(f.groupId), versionBefore);
+      assert.equal((await update(f.alice, id, { amountMinor: 9999, currencyCode: 'JPY' })).status, 200);
+      assert.equal((await update(f.alice, id, { currencyCode: 'jpy' })).status, 400);
+    });
+  });
 
   describe('編集（PATCH /expenses/:id）', () => {
     it('送った項目だけを変える。金額・内容・日付・カテゴリ・支払者を変えられる', async () => {

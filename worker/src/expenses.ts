@@ -214,6 +214,9 @@ async function registerableMonths(
   return { from: maxMonth(range.from, access.member.historyFromMonth), to: range.to };
 }
 
+/** 送られた通貨が、グループの通貨と違う。アプリは、グループ情報を読み直して、金額を入れ直してもらう。 */
+const currencyMismatch = (currencyCode: string): Response => conflict('currency_mismatch', { currencyCode });
+
 const monthNotRegisterable = (range: { from: string; to: string }): Response =>
   conflict('month_not_registerable', { from: range.from, to: range.to });
 
@@ -446,6 +449,11 @@ export async function handleCreateExpense(request: Request, env: Env, now: numbe
       }
     }
 
+    // 再送の判定のあとに見る(再送の間に通貨が変わっても、保存済みの支出を返す)。
+    if (input.currencyCode !== null && input.currencyCode !== access.group.currencyCode) {
+      return { reject: currencyMismatch(access.group.currencyCode) };
+    }
+
     const [range, category, members] = await Promise.all([
       registerableMonths(db, access, now),
       loadCategory(db, groupId, input.categoryId),
@@ -532,6 +540,9 @@ export async function handleUpdateExpense(
     const current = await loadExpense(db, groupId, expenseId);
     if (current === null || !canViewMonth(access, current.target_month)) return { reject: notFound() };
     if (!canWriteExpenses(access, now)) return { reject: forbidden() };
+    if (patch.currencyCode !== undefined && patch.currencyCode !== access.group.currencyCode) {
+      return { reject: currencyMismatch(access.group.currencyCode) };
+    }
     if (await isMonthClosed(db, groupId, current.target_month)) return { reject: conflict('month_closed') };
 
     const next: ExpenseRow = {

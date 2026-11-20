@@ -20,8 +20,17 @@ describe('支出の登録の入力', () => {
   it('正しい入力を読む', () => {
     const result = parseCreateExpense(valid);
     assert.ok(result.ok);
-    // id は任意。無ければ null（Workerが決める）。
-    assert.deepEqual(result.value, { ...valid, id: null, split: { method: 'category' } });
+    // id・currencyCode は任意。無ければ null（id はWorkerが決める。currencyCode は突き合わせない）。
+    assert.deepEqual(result.value, { ...valid, id: null, currencyCode: null, split: { method: 'category' } });
+  });
+
+  it('currencyCode(金額を入力したときの通貨)は任意。大文字3文字だけを受け付ける', () => {
+    const ok = create({ currencyCode: 'USD' });
+    assert.ok(ok.ok);
+    assert.equal(ok.value.currencyCode, 'USD');
+    for (const currencyCode of ['', 'usd', 'US', 'USDD', 'U1D', 1, null, {}]) {
+      assert.equal(failedField(create({ currencyCode })), 'currencyCode', JSON.stringify(currencyCode));
+    }
   });
 
   it('id（アプリが作る、登録の識別子）は任意。UUID（小文字）だけを受け付ける', () => {

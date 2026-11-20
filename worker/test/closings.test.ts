@@ -816,6 +816,69 @@ describe('月次集計・月締め・締め結果のAPI', () => {
       });
     });
 
+    // 費目の数の上限(MAX_CATEGORIES_PER_GROUP。30)と、メンバー6人の組み合わせ。上限の根拠(docs 9章)の実測。
+    // 割合を直していない月は、前の月の行を引き継ぐので、締めるときに設定30行と割合180行を書き足す。よくある月は
+    // こちらなので、「引き継ぐ月」を測る。「締める月に行がある月」は、書き足しが無い下限（グループを作った最初の月など）。
+    describe('D1のクエリ数: 費目の上限(30)・メンバー6人', () => {
+      const closeFullGroup = async (options: { inherit: boolean; leaver: boolean }) => {
+        const names = ['a1', 'a2', 'a3', 'a4', 'a5', 'a6'] as const;
+        const month = options.inherit ? '2026-11' : '2026-10';
+        // 脱退の確定は、締める月の分（脱退月 = 締める月）。
+        const g = await setup(names, options.leaver ? { a1: { leaveRequestedMonth: month } } : {});
+        const ids = names.map((name) => g.people[name].memberId);
+        const categoryIds = [g.categoryId];
+        for (let i = 1; i < 30; i += 1) {
+          const categoryId = await factory.addCategory(g.groupId, `c${i}`);
+          await insertCategoryRule(db, g.groupId, categoryId, '2026-10', equalShares(ids));
+          categoryIds.push(categoryId);
+        }
+        for (const categoryId of categoryIds) await pay(g, g.people.a2, 3000, '2026-10', undefined, categoryId);
+        if (options.inherit) {
+          // 10月を締めて精算してから、10月の行を引き継ぐ11月を締める。
+          const october = await api.close(g.people.a2, g.groupId, '2026-10');
+          assert.equal(october.status, 201, JSON.stringify(october.body));
+          for (const transfer of october.body.transfers) assert.equal((await api.settle(g.people.a2, transfer.id)).status, 200);
+          for (const categoryId of categoryIds) await pay(g, g.people.a2, 3000, '2026-11', undefined, categoryId);
+        }
+        const counting = countingEnv(env);
+        const closed = await api.close(g.people.a2, g.groupId, month, { env: counting.env });
+        assert.equal(closed.status, 201, JSON.stringify(closed.body));
+        if (options.inherit) {
+          assert.equal(
+            (await db.prepare(`SELECT count(*) AS n FROM category_month_settings WHERE group_id = ? AND target_month = '2026-11'`).bind(g.groupId).first<{ n: number }>())!.n,
+            30,
+            '締めるときに、設定30行を引き継いで書いた',
+          );
+        }
+        return counting.counts;
+      };
+
+      it('引き継ぐ月の月締め（よくある月）: 実測47。Freeの上限(50)にぎりぎり収まる', async () => {
+        const counts = await closeFullGroup({ inherit: true, leaver: false });
+        // 状態の読み込み10 + 書き込み29（バージョン1・設定2・割合10・締め1・集計1・負担12・送金1・脱退1）+ 結果の読み込み5。
+        assert.deepEqual(counts.batchSizes, [10, 29, 5]);
+        assert.ok(counts.queries <= 50, `クエリ数 ${counts.queries}`);
+      });
+
+      it('引き継ぐ月で、脱退の確定を含む月締め: 実測65。Freeの上限(50)を超える(公開前にPaidへ移す前提。docs 9章)', async () => {
+        const counts = await closeFullGroup({ inherit: true, leaver: true });
+        assert.deepEqual(counts.batchSizes, [10, 45, 5]);
+        assert.ok(counts.queries > 50 && counts.queries <= 70, `クエリ数 ${counts.queries}`);
+      });
+
+      it('締める月に行がある月（下限）: 実測35', async () => {
+        const counts = await closeFullGroup({ inherit: false, leaver: false });
+        assert.deepEqual(counts.batchSizes, [10, 17, 5]);
+        assert.ok(counts.queries <= 40, `クエリ数 ${counts.queries}`);
+      });
+
+      it('締める月に行がある月で、脱退の確定を含む: 実測53', async () => {
+        const counts = await closeFullGroup({ inherit: false, leaver: true });
+        assert.deepEqual(counts.batchSizes, [10, 33, 5]);
+        assert.ok(counts.queries > 50 && counts.queries <= 60, `クエリ数 ${counts.queries}`);
+      });
+    });
+
     describe('脱退が確定したメンバー（5章）', () => {
       it('関わる送金が0件なら、締めた時点で脱退済みになる', async () => {
         const g = await factory.createGroup(['alice', 'bob', 'carol'], { carol: { status: 'leaving', expenseEndMonth: '2026-10' } });
