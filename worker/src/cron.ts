@@ -9,11 +9,18 @@ import { monthIn } from './months.ts';
 /**
  * 1回の実行で使うD1のクエリ数の予算。D1は batch の1文も1クエリと数え、Freeは1回の呼び出しにつき50まで
  * （Paidは1000）。グループを1つ確定させるごとに約15クエリ使う（読み込み5〜6、書き込み約10。`worker/test/cron.test.ts`
- * で数えている）ので、Freeでは、1回に3グループほど。残りは次の回が引き受ける（APIは、脱退月が終わったメンバーを
+ * で数えている）ので、Freeでは、1回に2グループほど。残りは次の回が引き受ける（APIは、脱退月が終わったメンバーを
  * 確定したものとして扱う。access.ts の `isLeaveEffective`）ので、遅れても、利用者の見える挙動は変わらない。
  * **公開時にPaidへ移すときに、1000に近い値へ上げる。**
  */
 export const QUERY_BUDGET_PER_RUN = 50;
+
+/**
+ * 次のグループに使うクエリ数の見積もり（予算に収まるかの判定に使う）。最も大きい場合（最後の1人の脱退でグループを削除する。
+ * 読み込み3、書き込み16で、約19）に合わせる。割合の行がある先の月が多いと、これを超えることがある（超えたグループは、
+ * 例外になって `failedGroups` に入り、次の回に回るだけ）ので、見積もりであって、上限の保証ではない。
+ */
+export const ESTIMATED_QUERIES_PER_GROUP = 20;
 
 export interface CronSummary {
   /** 脱退を確定させたグループ（最後の1人の脱退で、削除したグループを含む）。 */
@@ -56,8 +63,9 @@ async function findGroupsWithDueLeaves(db: D1Database, now: number): Promise<str
  * 1時間ごとの定期処理。`now` は予定の時刻（Unixエポックのミリ秒）。失敗したグループがあれば、最後に投げる。
  *
  * グループは、古い月のものから。1つ目は、予算を超えても必ず処理する（そうしないと、1つのグループの費用が予算より大きいとき、
- * 永久に進まない）。2つ目からは、いままでに使った数と、これまでで最も大きかった1グループの費用の合計が、予算に収まるときだけ。
- * 予算を超えるグループは、`postponedGroups` として、次の回に回す。
+ * 永久に進まない）。2つ目からは、いままでに使った数と、次の1グループの見積もり（`ESTIMATED_QUERIES_PER_GROUP` と、
+ * これまでで最も大きかった1グループの費用の、大きいほう）の合計が、予算に収まるときだけ。
+ * 予算に収まらないグループは、`postponedGroups` として、次の回に回す。
  */
 export async function runScheduled(env: Env, now: number, queryBudget = QUERY_BUDGET_PER_RUN): Promise<CronSummary> {
   const groupIds = await findGroupsWithDueLeaves(env.DB, now);
@@ -70,7 +78,7 @@ export async function runScheduled(env: Env, now: number, queryBudget = QUERY_BU
   };
   let largest = 0;
   for (const [index, groupId] of groupIds.entries()) {
-    if (index > 0 && summary.queries + largest > queryBudget) {
+    if (index > 0 && summary.queries + Math.max(largest, ESTIMATED_QUERIES_PER_GROUP) > queryBudget) {
       summary.postponedGroups.push(groupId);
       continue;
     }

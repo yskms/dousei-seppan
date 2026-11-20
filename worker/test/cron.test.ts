@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import worker from '../src/index.ts';
-import { DUE_LEAVES_SQL, QUERY_BUDGET_PER_RUN, runScheduled } from '../src/cron.ts';
+import { DUE_LEAVES_SQL, ESTIMATED_QUERIES_PER_GROUP, QUERY_BUDGET_PER_RUN, runScheduled } from '../src/cron.ts';
 import {
   createFixtureFactory,
   equalShares,
@@ -254,6 +254,30 @@ describe('定期処理: 1回の実行のD1のクエリ数の予算', () => {
     // 割合のリセット4・招待・固定費2・脱退済み）。
     assert.equal(counting.counts.queries, summary.queries);
     assert.ok(counting.counts.queries >= 12 && counting.counts.queries <= 20, `クエリ数 ${counting.counts.queries}`);
+  });
+
+  it('次のグループが最も大きい場合（最後の1人の脱退でグループを削除する）の見積もりで判定する。前が小さくても、予算を超えない', async () => {
+    // 古い月（2026-10）の、普通のグループ。続いて、新しい月（2026-11）の、最後の1人が抜けるグループ（削除は約19クエリ）。
+    const names = ['alice', 'bob', 'carol'] as const;
+    const normal = await factory.createGroup(names, { alice: { leaveRequestedMonth: '2026-10' } });
+    await insertCategoryRule(db, normal.groupId, normal.categoryId, '2026-10', equalShares(names.map((n) => normal.people[n].memberId)));
+    const alone = await factory.createGroup(['alice'], { alice: { leaveRequestedMonth: '2026-11' } });
+    await insertCategoryRule(db, alone.groupId, alone.categoryId, '2026-10', equalShares([alone.people.alice.memberId]));
+
+    // 1つ目で16クエリ。見積もりが「これまでで最大の1グループ（15）」だと、16 + 15 = 31 <= 34 で2つ目に進み、19クエリのグループ削除で
+    // 35になって予算（34）を超える。見積もり（20）なら、16 + 20 = 36 > 34 で、2つ目は次の回に回す。
+    const budget = 34;
+    const counting = countingEnv(env);
+    const first = await runScheduled(counting.env, NOW_DECEMBER, budget);
+    assert.deepEqual(first.confirmedGroups, [normal.groupId]);
+    assert.deepEqual(first.postponedGroups, [alone.groupId]);
+    assert.ok(counting.counts.queries <= budget, `クエリ数 ${counting.counts.queries}`);
+
+    const countingAlone = countingEnv(env);
+    const second = await runScheduled(countingAlone.env, NOW_DECEMBER, budget);
+    assert.deepEqual(second.confirmedGroups, [alone.groupId]);
+    // グループの削除が、見積もり以下に収まっている（見積もりが、削除の費用に合っている）。
+    assert.ok(countingAlone.counts.queries - 1 <= ESTIMATED_QUERIES_PER_GROUP, `削除のクエリ数 ${countingAlone.counts.queries - 1}`);
   });
 
   it('予算が小さくても、1つ目のグループは必ず処理する（1つのグループの費用が予算より大きくても、進まなくならない）', async () => {
