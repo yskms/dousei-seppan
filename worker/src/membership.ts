@@ -233,10 +233,11 @@ export function confirmLeaveStatements(
 }
 
 /**
- * グループのデータをすべて物理削除する文（5章「グループの削除」）。外部キーに `ON DELETE CASCADE` を付けていない
- * ので、子から順に消す。最後の `expense_groups` の削除は、トークンの一致を条件にする。
+ * グループの配下のデータをすべて物理削除する文（5章「グループの削除」）。外部キーに `ON DELETE CASCADE` を付けていない
+ * ので、子から順に消す。`expense_groups` の行は消さない（`deleteGroupRowStatement`）。複数のグループにまたがる
+ * 書き込み（アカウント削除）では、グループの行の削除を、ほかの文の最後にまとめるため、分けてある。
  */
-export function deleteGroupStatements(db: D1Database, token: string, groupId: string): D1PreparedStatement[] {
+export function deleteGroupChildrenStatements(db: D1Database, token: string, groupId: string): D1PreparedStatement[] {
   const children = [
     'settlement_transfers',
     'closing_category_burdens',
@@ -253,10 +254,17 @@ export function deleteGroupStatements(db: D1Database, token: string, groupId: st
     'invites',
     'group_members',
   ];
-  return [
-    ...children.map((table) =>
-      db.prepare(`DELETE FROM ${table} WHERE group_id = ? AND EXISTS (${GROUP_WRITE_GUARD})`).bind(groupId, groupId, token),
-    ),
-    db.prepare('DELETE FROM expense_groups WHERE id = ? AND write_token = ?').bind(groupId, token),
-  ];
+  return children.map((table) =>
+    db.prepare(`DELETE FROM ${table} WHERE group_id = ? AND EXISTS (${GROUP_WRITE_GUARD})`).bind(groupId, groupId, token),
+  );
+}
+
+/** `expense_groups` の行を消す文。token の一致を条件にする。配下のデータを消したあとで使う。 */
+export function deleteGroupRowStatement(db: D1Database, token: string, groupId: string): D1PreparedStatement {
+  return db.prepare('DELETE FROM expense_groups WHERE id = ? AND write_token = ?').bind(groupId, token);
+}
+
+/** グループのデータをすべて物理削除する文（5章「グループの削除」）。 */
+export function deleteGroupStatements(db: D1Database, token: string, groupId: string): D1PreparedStatement[] {
+  return [...deleteGroupChildrenStatements(db, token, groupId), deleteGroupRowStatement(db, token, groupId)];
 }

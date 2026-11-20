@@ -18,8 +18,8 @@
 // 先に確定すると、バージョンは v + 1 になっているため、負けた側の後続SQLまで実行されてしまう
 // （test/groupWrite.test.ts の「簡略化した条件では…」が、その実例）。
 //
-// 注意3: 1つのグループへの書き込み用。複数のグループにまたがる書き込み（アカウント削除）は未決
-// （docs/backend-design.md 12章）。
+// 注意3: 1つのグループへの書き込み用。複数のグループにまたがる書き込み（アカウント削除）は、下の
+// `writeToGroups`（docs/backend-design.md 8章）。
 
 /**
  * 後続のSQLに付ける条件のSELECT。`WHERE EXISTS (${GROUP_WRITE_GUARD})` の形で使い、
@@ -127,6 +127,61 @@ export async function writeToGroup(
 
   // 0件なら、他のリクエストが先に書いている。後続のSQLも条件を満たさず、何も変更されていない。
   if (results[0].meta.changes === 0) return { ok: false, reason: 'version' };
+  return { ok: true, token, results: results.slice(1) };
+}
+
+/** `writeToGroups` に渡す、グループと、そのグループについて読んだバージョン。 */
+export interface GroupVersion {
+  groupId: string;
+  expectedVersion: number;
+}
+
+/**
+ * 複数のグループにまたがる書き込み（アカウント削除。docs/backend-design.md 5章・8章）。
+ *
+ * 1文の UPDATE で、**すべてのグループ**の `data_version` が読んだときのままのときだけ、全グループのバージョンを上げて、
+ * 同じ token を書く（1つでも合わなければ、どのグループも変えない）。後続のSQLは、`writeToGroup` と同じ
+ * GROUP_WRITE_GUARD を、自分のグループの token に対して付ける。token を書くのは、この1文だけで、全グループか、
+ * どのグループにも書かれないかのどちらかなので、1つのグループの条件だけで、全グループが揃っていることになる。
+ * （グループごとに別々のUPDATEにすると、一部のグループだけ書き込めた状態が残る。8章）
+ *
+ * - グループ・バージョンは、`json_each` の1つの束縛で渡す（束縛の上限100を、グループの数に制限されないため）。
+ * - `extraCondition`: バージョンを上げる文の WHERE に足す条件（`AND` でつなぐ。プレースホルダーは `?` で、`bindings` の
+ *   順）。アカウント削除は、「読んだあとに、新しいグループのメンバーになっていない」ことを、ここで確かめる。
+ * - `build` は、token を受け取り、書き込みのSQLを返す。各SQLに GROUP_WRITE_GUARD を付けること。**グループ自体
+ *   （`expense_groups` の行）を消す文は、最後にまとめる**（途中で消すと、そのグループの token の条件で、後続の文が
+ *   効かなくなる）。
+ * - `groups` は、重複しないこと。空は不可（書くグループが無ければ、このAPIは要らない）。
+ */
+export async function writeToGroups(
+  db: D1Database,
+  groups: readonly GroupVersion[],
+  build: (token: string) => D1PreparedStatement[],
+  extraCondition: { sql: string; bindings: readonly (string | number)[] } | null = null,
+): Promise<GroupWriteResult> {
+  if (groups.length === 0) throw new Error('書くグループが無い');
+  if (new Set(groups.map((group) => group.groupId)).size !== groups.length) throw new Error('グループが重複している');
+  const token = crypto.randomUUID();
+  const versions = JSON.stringify(groups.map((group) => ({ id: group.groupId, v: group.expectedVersion })));
+  const bump = db
+    .prepare(
+      `UPDATE expense_groups SET data_version = data_version + 1, write_token = ?
+        WHERE id IN (SELECT json_extract(value, '$.id') FROM json_each(?))
+          AND (SELECT count(*) FROM expense_groups g JOIN json_each(?) j
+                ON g.id = json_extract(j.value, '$.id') AND g.data_version = json_extract(j.value, '$.v')) = ?
+          ${extraCondition === null ? '' : `AND ${extraCondition.sql}`}`,
+    )
+    .bind(token, versions, versions, groups.length, ...(extraCondition?.bindings ?? []));
+
+  let results: D1Result[];
+  try {
+    results = await db.batch([bump, ...build(token)]);
+  } catch (error) {
+    if (isUniqueViolation(error)) return { ok: false, reason: 'unique' };
+    throw error;
+  }
+  // 全グループに効いていなければ、1つも書かれていない（後続のSQLも、条件を満たさず、何も変更していない）。
+  if (results[0].meta.changes !== groups.length) return { ok: false, reason: 'version' };
   return { ok: true, token, results: results.slice(1) };
 }
 
