@@ -1,4 +1,5 @@
 // 入口。エンドポイントは docs/backend-design.md 9章の順に足す。
+import { handleLogin, handleLogout, handleNonce } from './auth.ts';
 import {
   handleCreateCategory,
   handleGetCategoryRules,
@@ -62,6 +63,11 @@ export default {
 
     const { pathname } = new URL(request.url);
     const now = Date.now();
+
+    // 認証（docs/backend-design.md 9章の「認証API」）。セッションを要らない入口はここだけ（招待の確認以降は要る）。
+    if (pathname === '/auth/nonce') return handleNonce(request, env, now);
+    if (pathname === '/auth/login') return handleLogin(request, env, now);
+    if (pathname === '/auth/logout') return handleLogout(request, env, now);
 
     if (GROUPS_PATH.test(pathname)) {
       if (request.method === 'GET') return handleListGroups(request, env, now);

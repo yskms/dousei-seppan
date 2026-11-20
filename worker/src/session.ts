@@ -1,11 +1,15 @@
-// セッションの認証。Singfolio（worker/src/session.ts）の `authenticateSession` と、それが使うものだけの
-// コピー（コピー元: singfolio 61e0a82）。セッションの発行・失効（createSession・revokeSession・
-// revokeOtherSessions）は、ログイン・ログアウトのAPIと一緒に、あとで同じ元から取り込む。
+// セッションの発行・認証・失効。Singfolio（worker/src/session.ts）からのコピー（コピー元: singfolio 61e0a82）。
+// コメントの「§8」「7.3.x」は Singfolio の docs の章番号で、ここでは読めない。
+// コピーしていないもの: `revokeOtherSessions`（「ほかの端末をすべてログアウト」。このアプリでは、まだ画面もAPIも無い）。
+// `markUserActiveStatement` は、Singfolioでは account.ts にあるが、ここでは、使うのがこのファイルだけなので、ここに置く。
 // Singfolio側を直したときは、差分を手で取り込む（docs/backend-design.md 1章）。
 //
 // セッションの値は、不透明なランダム値（32バイト = base64url の43字。JWTにしない）。D1の `sessions` には
 // ハッシュ（SHA-256 の base64url）だけを置き、値そのものは端末のSecureStoreにだけある。値は
 // `Authorization: Bearer <値>` で送る（URLに載せない）。ログにも出さない。
+
+import type { IdTokenProvider } from './idToken.ts';
+import { toBase64Url } from './nonce.ts';
 
 // 期限は、最後の利用から90日（目安）。最後の利用の時刻（`last_used_at`）は、前回の書き込みから24時間以上
 // たったときだけ書くので、期限は実際の最後の利用から、最大24時間早まる。
@@ -15,14 +19,6 @@ export const SESSION_TOUCH_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const BEARER_PATTERN = /^bearer ([A-Za-z0-9_-]{43})$/i;
-
-export type IdTokenProvider = 'apple' | 'google';
-
-export function toBase64Url(bytes: Uint8Array): string {
-  let binary = '';
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
 
 export function isSessionToken(value: unknown): value is string {
   return typeof value === 'string' && TOKEN_PATTERN.test(value);
@@ -46,6 +42,37 @@ export function markUserActiveStatement(db: D1Database, userId: string, now: num
   return db
     .prepare('UPDATE users SET last_active_at = ?1 WHERE id = ?2 AND (last_active_at IS NULL OR last_active_at < ?1)')
     .bind(now, userId);
+}
+
+/**
+ * セッションを発行して、値を返す（D1に置くのはハッシュだけ）。
+ * 同じログイン手段（`identity`）の、期限を過ぎたセッションを、同じバッチで消す（Cron Triggerは使わない）。
+ * 全体を掃除しない（`identity_id` の索引で引けるので、件数が増えても、ログインの費用が増えない）。
+ * 二度とログインしない人の、期限を過ぎた行は残る（1行は小さく、認証には使えない）。
+ *
+ * **発行しないことがある（null）**: ログイン手段の行が無い（直前にAppleの `account-deleted` で消えた）、または
+ * `consent_revoked_at`（Appleの `consent-revoked` の `event_time`）が、このログインの開始時刻（`now`）と同じか、それより後。
+ * 同じミリ秒は、取り消しより前と見る（通知の削除の条件 `created_at <= event_time` と同じ側。通知とログインのどちらが先でも、
+ * 取り消しと同じ時刻に始まったログインのセッションは、残らない）。
+ * ログインは、検証を通ったあと、ここへ来るまでの間に、通知の処理が入りうる。通知を先に処理した場合のセッションを、
+ * ここで作らない（通知を後に処理した場合は、通知が消す）。条件は INSERT の1文の中で見るので、通知の処理
+ * （削除と記録の1バッチ）と、どちらが先でも、取り消し後のセッションは残らない（migrations/0001_auth.sql の
+ * `consent_revoked_at`）。このアプリは、Appleのサーバー間通知をまだ受けない（docs/backend-design.md 12章）が、
+ * 条件は先に入れてある。
+ */
+export async function createSession(db: D1Database, identityId: string, now: number): Promise<string | null> {
+  const token = toBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+  const [, insert] = await db.batch([
+    db.prepare('DELETE FROM sessions WHERE identity_id = ?1 AND last_used_at <= ?2').bind(identityId, now - SESSION_TTL_MS),
+    db
+      .prepare(
+        `INSERT INTO sessions (token_hash, identity_id, created_at, last_used_at)
+         SELECT ?1, ?2, ?3, ?3
+         WHERE EXISTS (SELECT 1 FROM identities WHERE id = ?2 AND (consent_revoked_at IS NULL OR consent_revoked_at < ?3))`,
+      )
+      .bind(await hashToken(token), identityId, now),
+  ]);
+  return insert!.meta.changes === 1 ? token : null;
 }
 
 export interface AuthenticatedSession {
@@ -94,4 +121,29 @@ export async function authenticateSession(
     ]);
   }
   return { userId: row.user_id, identityId: row.identity_id, sub: row.sub, provider: row.provider };
+}
+
+/**
+ * セッションを失効させる（行の削除）。無い値でも成功にする（何度呼んでも結果が同じ。ログアウトは、
+ * 値を持っている側だけが呼べる）。
+ * 消す前に、そのセッションのアカウントの最後に使った時刻を進める（同じバッチ。消すと、アカウントを引けなくなる）。
+ * ログアウトは、アプリを使った操作で、これで「ログアウトの1か月後に、未使用1年として消える」穴を塞ぐ。
+ * **期限切れ（`SESSION_TTL_MS` 以上使っていない）のセッションでは進めない**（行は消す）。`authenticateSession` が、期限切れでは
+ * 時刻を進めないのと揃える: 最後に使った時刻は、有効なセッションか、サインインの成功でだけ進む。古い端末に残った値でのログアウトで、
+ * アカウントの期限を延ばさない。期限切れの行は、次の `createSession` まで残りうる。
+ */
+export async function revokeSession(db: D1Database, token: string, now: number): Promise<void> {
+  if (!isSessionToken(token)) return;
+  const hash = await hashToken(token);
+  await db.batch([
+    db
+      .prepare(
+        `UPDATE users SET last_active_at = ?1
+         WHERE id = (SELECT i.user_id FROM sessions s JOIN identities i ON i.id = s.identity_id
+                     WHERE s.token_hash = ?2 AND s.last_used_at > ?3)
+           AND (last_active_at IS NULL OR last_active_at < ?1)`,
+      )
+      .bind(now, hash, now - SESSION_TTL_MS),
+    db.prepare('DELETE FROM sessions WHERE token_hash = ?1').bind(hash),
+  ]);
 }

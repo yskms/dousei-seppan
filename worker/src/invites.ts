@@ -37,7 +37,8 @@ import {
   resetMonthsStatements,
 } from './membership.ts';
 import { monthIn } from './months.ts';
-import { hashToken, toBase64Url } from './session.ts';
+import { toBase64Url } from './nonce.ts';
+import { hashToken } from './session.ts';
 
 /** 招待の有効期間（発行から3日）。 */
 export const INVITE_TTL_MS = 3 * 24 * 60 * 60 * 1000;

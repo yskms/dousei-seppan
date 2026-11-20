@@ -495,16 +495,41 @@ URLやHTTPメソッドは実装時に調整してよい。以下は責務の整�
 
 ### 認証（Singfolioに揃える）
 
-| API | 役割 |
-|---|---|
-| `POST /auth/nonce` | nonceの発行 |
-| `POST /auth/login` | Apple（iOS）・Googleのログイン |
-| `GET /auth/apple/callback`、`POST /auth/apple/login` | AndroidでのAppleログイン（Web経由） |
-| `POST /auth/apple/notifications` | Appleのサーバー間通知 |
-| `POST /auth/logout` | ログアウト |
-| `POST /auth/delete` | アカウント削除（再認証つき） |
+| API | 役割 | 状態 |
+|---|---|---|
+| `POST /auth/nonce` | nonceの発行 | 実装済み |
+| `POST /auth/login` | Apple（iOS）・Googleのログイン | 実装済み |
+| `POST /auth/logout` | ログアウト | 実装済み |
+| `GET /auth/apple/callback`、`POST /auth/apple/login` | AndroidでのAppleログイン（Web経由） | 未実装（12章） |
+| `POST /auth/apple/notifications` | Appleのサーバー間通知 | 未実装（12章） |
+| `POST /auth/delete` | アカウント削除（再認証つき） | 未実装（12章） |
 
 Webからのアカウント削除依頼（Google Play向け）の本人確認は未決（企画メモ16章）。Singfolioの、Web経由のAppleログインと同じ手順を使う案。
+
+#### 認証API（実装済み）
+
+実装は `worker/src/auth.ts`（入口）と `worker/src/login.ts`（ログインの処理）。`nonce.ts`・`idToken.ts`・`identity.ts`・`session.ts` とあわせて、Singfolioの同名のファイルのコピー（コピー元: singfolio 61e0a82）。このアプリで変えたところは、各ファイルの先頭のコメントに書いてある（`login.ts` はネイティブのサインインだけ、`audienceFor` の Services ID は省略可能、`/auth/logout-others` は持たない）。コピーしたファイルの構造は、Singfolioの差分を手で取り込めるよう保つ（整形・分割をしない）。
+
+| API | 本文 | 成功 |
+|---|---|---|
+| `POST /auth/nonce` | `{ "kind": "native" }` | 200 `{ nonce, expiresAt }`。有効は5分。D1に書かない（認証の要らない入口が書くと、Freeの書き込みの上限を使い切られる） |
+| `POST /auth/login` | `{ "provider": "apple" \| "google", "idToken", "nonce" }`（`nonce` は直前に受け取った値） | 200 `{ session }` |
+| `POST /auth/logout` | なし。`Authorization: Bearer <session>` | 204（本文なし） |
+
+- アプリの手順：`/auth/nonce` で `nonce`（以下 T）を得る → T の SHA-256 の base64url（43字）を、Apple / Googleのサインインの `nonce` に渡す → 得たIDトークンと T を `/auth/login` に送る → 返った `session` を端末のSecureStoreに置き、以降は `Authorization: Bearer <session>` で送る（URLに載せない。ログにも出さない）。
+- アカウントは、初めてのログインで作られる（登録の操作は無い）。作られた直後はグループに入っていない（グループを作るか、招待で参加する）。同じ `sub` でも、AppleとGoogleは別のアカウントで、自動ではつなげない。保存するのは `sub` と手段（`apple` / `google`）だけで、メール・名前は受け取っても捨てる。
+- 受け付けるIDトークンの `aud` は、Appleが `APPLE_BUNDLE_ID`（`com.yskms.warikanseikatsu`）、Googleがサーバー用（Web）のクライアントID（`GOOGLE_WEB_CLIENT_ID`。iOSでもAndroidでも同じ）。どちらも `wrangler.jsonc` の `vars`。
+- T は使い切り。IDトークンの検証まで通ったあとに使用済みにする（失敗した T は、同じ T で正しいトークンなら通る）。リプレイは401。
+- セッションの期限は、最後に使ってから90日（目安）。24時間に1回だけ「最後に使った時刻」を書く（毎回書くと、認証済みのリクエストの数だけ書き込みを使う）。ログインごとに別の値を発行するので、端末ごとに持てる。
+- ログアウトは、そのセッションだけを消す。何度呼んでも、知らない値でも204（`Authorization` が無い・形が違うときだけ401）。他の端末のセッションは残る。
+
+| 状態 | `error` | 意味 |
+|---|---|---|
+| 400 | `invalid_request` | 本文の形が不正（`provider`・`idToken`・`nonce` の欠落や型、`kind` の誤り、JSONでない） |
+| 401 | `unauthorized` | ログイン：T・IDトークンの検証に通らない。どの検査で落ちたかは教えない。ログアウト：`Authorization` が無い・形が違う |
+| 405 | `method_not_allowed` | POST 以外 |
+| 413 | `payload_too_large` | 本文が大きすぎる（nonce 1KB、login 10KB） |
+| 503 | `service_unavailable` | Apple / Googleの公開鍵を取得できない（トークンの問題ではない。アプリがやり直せる） |
 
 ### グループ・メンバー・招待
 
@@ -1012,7 +1037,12 @@ Webからのアカウント削除依頼（Google Play向け）の本人確認は
 - **固定費の自動登録の毎時の検索は、固定費の表を全部読む。** 止まっている・終了したものも含む（生成記録は主キーで引く）。固定費が1万件で、毎時1万行（月720万行）。D1の読み取り行数の課金（付録Aの冒頭）の上では小さいが、公開後の件数で確かめる。減らす案：終了した固定費を除く部分索引（`end_month` が過ぎたものは、更新の手間と引き換え）。
 - **1人が作れるグループの数の上限。** 決めていない。`POST /groups` は、1回で約20行を書き、上限が無いと、1人がグループを作り続けられる。アカウント削除は、Freeでは4グループまで（上の項目）。メンバー数の上限（5人。5章の「参加」）は決めた。
 
-- **ログイン・ログアウトのAPIが13章の順に無い。** 支出のAPIのために、認証のうちセッションの確認（`worker/src/session.ts` の `authenticateSession`）だけをSingfolioからコピーした。ログイン（`/auth/nonce`・`/auth/login`・AndroidのApple）、ログアウト、アカウント削除は未実装。アプリから呼べるようにするまでに、同じ元から取り込む。
+- **認証の残り。** `/auth/nonce`・`/auth/login`・`/auth/logout` は実装した（9章の「認証API」）。まだ無いもの：
+  - AndroidのAppleログイン（Web経由。`/auth/apple/callback`・`/auth/apple/login`）。Singfolioの `appleWeb.ts`・`appleToken.ts`・`appleClientSecret.ts` と、`login.ts` の `web` の経路を取り込む。Apple DeveloperでServices ID・Return URL・鍵を作る必要があり、`wrangler.jsonc` に `APPLE_SERVICES_ID`・`APPLE_TEAM_ID`・`APPLE_KEY_ID`、秘密情報に `APPLE_PRIVATE_KEY` を足す。足すまで、`/auth/nonce` の `web` の T は発行されても使い道がない（`audienceFor` が `web` を拒否する）。
+  - Appleのサーバー間通知（`/auth/apple/notifications`）。`createSession` の `consent_revoked_at` の条件と、`identities` の列は、先に入れてある。
+  - `POST /auth/delete`（再認証とAppleのrevoke）。データの処理は `deleteAccount` に実装済みで、再認証のあとにこれを呼ぶ。
+  - 「ほかの端末をすべてログアウト」（Singfolioの `/auth/logout-others`、`revokeOtherSessions`）。画面が決まったら取り込む。
+- **公開前に埋める認証の値。** `wrangler.jsonc` の `GOOGLE_WEB_CLIENT_ID` は、Google Cloudでクライアントを作るまでの、実在しない値にしてある（Googleログインは、どのトークンも拒否される。`worker/test/config.test.ts` が、形を確かめる）。サーバー用（Web）のクライアントIDを作って置き換える（iOS・Androidのクライアントは、同じプロジェクトに作る。アプリが渡す値と同じにする）。本番のWorkerには `wrangler secret put NONCE_HMAC_KEY` で32バイト以上の乱数を入れる（ローカルは `worker/.dev.vars`。見本は `.dev.vars.example`）。
 
 （以前の確認事項は、固定費の月末日を7章、匿名化の範囲を5章、対応通貨を2章、割合を直せる月の範囲を9章の「費目・負担割合API」で決めた）
 
@@ -1027,7 +1057,7 @@ Webからのアカウント削除依頼（Google Play向け）の本人確認は
 5. 支出CRUD APIを実装する。（実装済み。仕様は9章の「支出API」。費目・メンバー・グループを作るAPIはまだ無いので、テストはSQLで用意している）
 6. 月締め・精算・繰越APIを実装する。（実装済み。仕様は9章の「月締め・精算API」。テストは SQL で準備した月・支出・費目の割合に対して行っている）
 7. 招待・参加・脱退・匿名化APIと、Cronの処理を実装する。（実装済み。仕様は9章の「招待・参加・脱退API」と5章・7章・8章。脱退の確定は `worker/src/membership.ts` に集め、月締め・脱退を選ぶ操作・月初のCronが同じ関数を使う。脱退済みへの遷移は `markLeftStatement`（`worker/src/closedMonth.ts`）で、5章の4の規則（繰越先の月が未締めの繰越は、未処理と同じに扱う）をここに持たせている。アカウント削除は、データ処理の `deleteAccount` まで。`POST /auth/delete` は、まだ無い。12章）
-   - 7のあとに、グループ・費目・負担割合のAPIを実装した（仕様は9章の「グループAPI」「費目・負担割合API」）。そのあとに、固定費のAPIと固定費の自動登録のCronを実装した（仕様は9章の「固定費API」と7章。自動登録は `worker/src/recurringRun.ts`）。そのあとに、ホームの月ピッカー用の月の一覧API（`GET /groups/:id/months`。仕様は9章の「月締め・精算API」の「月の一覧」）を実装した。
+   - 7のあとに、グループ・費目・負担割合のAPIを実装した（仕様は9章の「グループAPI」「費目・負担割合API」）。そのあとに、固定費のAPIと固定費の自動登録のCronを実装した（仕様は9章の「固定費API」と7章。自動登録は `worker/src/recurringRun.ts`）。そのあとに、ホームの月ピッカー用の月の一覧API（`GET /groups/:id/months`。仕様は9章の「月締め・精算API」の「月の一覧」）を実装した。そのあとに、ログイン・ログアウトのAPI（`/auth/nonce`・`/auth/login`・`/auth/logout`。仕様は9章の「認証API」）を、Singfolioからコピーして実装した。AndroidのAppleログイン、Appleの通知、`POST /auth/delete` は残っている（12章）。
 8. 競合・権限・二重登録の統合テストを実施する。（実施済み。11章の必須テストを、既存のテストと1つずつ照らした。足りなかった「支出の二重送信」は、アプリが作る `id` を冪等キーにする仕様に決め（9章の「二重送信」）、`worker/test/expenses.test.ts` に検査を足した。通貨の小数桁数（USD 2・KWD 3）の検査は `worker/test/closings.test.ts`。APIをまたぐ流れ（招待 → 参加 → 支出と再送 → 月締め → 繰越 → 脱退の確定 → 精算 → 脱退済み → Cron）は `worker/test/scenario.test.ts` で、実際のAPIの呼び出しだけでつなぐ。11章のうち未実施なのは、割合を直すAPI経由の検査。固定費は、固定費のAPIとCronを実装したときに実施した（`worker/test/recurring.test.ts`・`recurringRun.test.ts`）。並行して走るリクエストでの性質は、ローカルD1では確かめられないので、9のとおり本番D1で確認する）
 9. Workers FreeでCPU時間・D1クエリ数を確認し、公開前にPaidへ移行するか判断する。あわせて、本番D1で次を確認する（ローカルD1では確かめられないもの）。
    - 8章の競合制御が、並行して走るリクエストでも、成功を1つに絞ること。

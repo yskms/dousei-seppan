@@ -1,5 +1,6 @@
 // レスポンスと本文の読み取り。Singfolio（worker/src/http.ts）からのコピー（コピー元: singfolio 61e0a82）に、
 // このアプリで足したもの（invalidRequest の field、notFound・forbidden・conflict）を加えた。
+// serviceUnavailable は、Singfolioの同名のものと同じ。
 // Singfolio側を直したときは、差分を手で取り込む（docs/backend-design.md 1章）。
 
 export function json(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
@@ -18,6 +19,8 @@ export const invalidRequest = (field?: string): Response =>
 export const payloadTooLarge = (): Response => json({ error: 'payload_too_large' }, 413);
 // 認証に失敗したときの応答。どの検査で落ちたかを、呼んだ側に教えない。
 export const unauthorized = (): Response => json({ error: 'unauthorized' }, 401);
+// 認証の相手（公開鍵の取得元）が使えないとき。トークンの問題ではないので、アプリがやり直せる。
+export const serviceUnavailable = (): Response => json({ error: 'service_unavailable' }, 503);
 // グループのメンバーだが、その操作は許されない（脱退が確定した後の書き込み、参加前の月の閲覧など）。
 export const forbidden = (): Response => json({ error: 'forbidden' }, 403);
 // 無い、または見せない（他のグループのID、メンバーでない人。両者を区別しない）。

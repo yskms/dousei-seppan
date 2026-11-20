@@ -18,6 +18,8 @@ export interface LocalDatabase {
 }
 
 export async function openLocalDatabase(): Promise<LocalDatabase> {
+  // 必須の秘密情報（wrangler.jsonc の secrets.required）が無いと警告が出る。DBの検査には使わない。
+  process.env.NONCE_HMAC_KEY ??= 'test-only-value';
   const stateDir = mkdtempSync(path.join(tmpdir(), 'warikan-seikatsu-d1-'));
   const wrangler = path.join(workerDir, 'node_modules', '.bin', 'wrangler');
   execFileSync(wrangler, ['d1', 'migrations', 'apply', 'DB', '--local', '--persist-to', stateDir], {

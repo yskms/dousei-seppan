@@ -23,6 +23,27 @@
     "redact_query_string": true
   },
 
+  // 秘密情報は、このファイルにも、リポジトリにも書かない。本番は `wrangler secret put`、
+  // ローカルは .dev.vars（gitignore。.dev.vars.example が見本）。ここに名前を書くと、
+  // デプロイの前に、本番に無い秘密情報を検出でき、型（Env）にも出る。
+  "secrets": {
+    "required": ["NONCE_HMAC_KEY"]
+  },
+
+  // IDトークンの `aud`（src/idToken.ts の audienceFor）。どれも公開してよい識別子で、秘密情報ではない
+  // （アプリに埋め込まれる、またはAppleの設定画面で付けた名前）。Googleのクライアントの `client_secret` は使わない。
+  // APPLE_BUNDLE_ID は app.json の ios.bundleIdentifier と同じ（test/config.test.ts が固定している）。
+  //
+  // GOOGLE_WEB_CLIENT_ID は、まだ作っていない（Google Cloudで、サーバー用（Web）のクライアントIDを作る）。
+  // 作るまでは、実在しない値にしてあり、どのGoogleのIDトークンも aud が合わず拒否される（Googleログインは通らない）。
+  // 作ったら置き換える（docs/backend-design.md 12章）。
+  // AndroidのAppleログイン（Web経由）に要る APPLE_SERVICES_ID・APPLE_TEAM_ID・APPLE_KEY_ID と、秘密鍵
+  // APPLE_PRIVATE_KEY は、そのログインを足すときに加える（docs/backend-design.md 12章）。
+  "vars": {
+    "APPLE_BUNDLE_ID": "com.yskms.warikanseikatsu",
+    "GOOGLE_WEB_CLIENT_ID": "0-not-created-yet.apps.googleusercontent.com"
+  },
+
   // 本番のD1を作るまでは、ローカル専用。database_id は、本番のD1を作ったときにそのIDに置き換える（秘密ではない）。
   "d1_databases": [
     {
