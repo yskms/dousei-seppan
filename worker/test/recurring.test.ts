@@ -9,7 +9,7 @@ import { MAX_RECURRING_EXPENSES_PER_GROUP } from '../src/limits.ts';
 import { createFixtureFactory, insertClosing, insertRecurringRow, NOW, type Fixture, type Person } from './apiFixture.ts';
 import { groupsApi } from './groupsApi.ts';
 import { openLocalDatabase, type LocalDatabase } from './localDatabase.ts';
-import { interferingEnv, read, request } from './monthApi.ts';
+import { interferingEnv, NOW_DECEMBER, read, request } from './monthApi.ts';
 import { recurringApi } from './recurringApi.ts';
 
 describe('固定費のAPI', () => {
@@ -305,6 +305,25 @@ describe('固定費のAPI', () => {
       assert.equal(await versionOf(f.groupId), version + 1, '再送では上がらない（上がったのは、変更の分だけ）');
       const count = await db.prepare('SELECT count(*) AS n FROM recurring_expenses WHERE id = ?').bind(id).first<{ n: number }>();
       assert.equal(count!.n, 1);
+    });
+
+    it('再送の200にも thisMonthSkipped を返す（今月の「作らなかった」記録から導く）。月が変われば false', async () => {
+      const f = await createFixture();
+      // NOW は 2026-11-19。毎月5日は今月の予定日を過ぎていて、25日はまだ。
+      const late = randomUUID();
+      const first = await api.create(f.alice, f.groupId, body(f, { id: late, dayOfMonth: 5 }));
+      assert.deepEqual([first.status, first.body.thisMonthSkipped], [201, true]);
+      const again = await api.create(f.alice, f.groupId, body(f, { id: late, dayOfMonth: 5 }));
+      assert.deepEqual([again.status, again.body.thisMonthSkipped], [200, true]);
+      assert.equal(again.body.recurringExpense.id, late);
+      const nextMonth = await api.create(f.alice, f.groupId, body(f, { id: late, dayOfMonth: 5 }), { now: NOW_DECEMBER });
+      assert.deepEqual([nextMonth.status, nextMonth.body.thisMonthSkipped], [200, false], '12月には、12月の記録は無い');
+
+      const early = randomUUID();
+      const firstEarly = await api.create(f.alice, f.groupId, body(f, { id: early, dayOfMonth: 25 }));
+      assert.deepEqual([firstEarly.status, firstEarly.body.thisMonthSkipped], [201, false]);
+      const resent = await api.create(f.alice, f.groupId, body(f, { id: early, dayOfMonth: 25 }));
+      assert.deepEqual([resent.status, resent.body.thisMonthSkipped], [200, false]);
     });
 
     it('他のグループが使っているidは、中身を返さず409', async () => {
@@ -670,12 +689,20 @@ describe('固定費のAPI', () => {
     });
   });
 
-  describe('削除（一度も支出を作っていない固定費だけ）', () => {
-    const runRow = (groupId: string, recurringId: string) =>
+  describe('削除（一度も支出を作っていない固定費だけ。作らなかった記録は数えない）', () => {
+    // 生成記録。`expenseId` が null は「今月の分は作らなかった」記録、あれば支出を作った記録（支出を消しても残る）。
+    const runRow = (groupId: string, recurringId: string, expenseId: string | null = 'expense-made', month = '2026-10') =>
       db
-        .prepare('INSERT INTO recurring_expense_runs (group_id, recurring_expense_id, scheduled_month, expense_id, created_at) VALUES (?, ?, ?, NULL, ?)')
-        .bind(groupId, recurringId, '2026-10', NOW)
+        .prepare('INSERT INTO recurring_expense_runs (group_id, recurring_expense_id, scheduled_month, expense_id, created_at) VALUES (?, ?, ?, ?, ?)')
+        .bind(groupId, recurringId, month, expenseId, NOW)
         .run();
+    const runsOf = async (recurringId: string) =>
+      (
+        await db
+          .prepare('SELECT scheduled_month, expense_id FROM recurring_expense_runs WHERE recurring_expense_id = ? ORDER BY scheduled_month')
+          .bind(recurringId)
+          .all<{ scheduled_month: string; expense_id: string | null }>()
+      ).results;
     const del = (who: Person | null, id: string, options: { env?: Env } = {}) => api.remove(who, id, options);
 
     it('一度も支出を作っていない固定費は消せる。負担設定も消え、一覧から無くなり、バージョンが上がる', async () => {
@@ -705,7 +732,7 @@ describe('固定費のAPI', () => {
       assert.equal((await groups.getGroup(f.alice, f.groupId)).body.group.currencyLocked, false);
     });
 
-    it('一度でも支出を作った（生成記録がある）固定費は消せない（409）。止める・終了月は使える', async () => {
+    it('一度でも支出を作った（支出を作った生成記録がある）固定費は消せない（409）。止める・終了月は使える', async () => {
       const f = await createFixture();
       const { id } = await created(f);
       await runRow(f.groupId, id);
@@ -713,6 +740,43 @@ describe('固定費のAPI', () => {
       assert.deepEqual([result.status, result.body], [409, { error: 'recurring_expense_in_use' }]);
       assert.notEqual(await rowOf(id), null);
       assert.equal((await api.update(f.alice, id, { paused: true, endMonth: '2026-12' })).status, 200);
+    });
+
+    it('作った支出を消しても、生成記録は残るので、固定費は消せない（作り直さない記録と同じ根拠）', async () => {
+      const f = await createFixture();
+      const { id } = await created(f);
+      await runRow(f.groupId, id, 'expense-deleted-by-user'); // 支出の行は無い（消された）。expense_id は外部キーではない
+      assert.equal((await del(f.alice, id)).status, 409);
+      assert.deepEqual(await runsOf(id), [{ scheduled_month: '2026-10', expense_id: 'expense-deleted-by-user' }]);
+    });
+
+    it('予定日を過ぎてから登録した固定費（今月の分は作らなかった記録がある）は消せる。記録も一緒に消え、通貨のロックも外れる', async () => {
+      const f = await createFixture();
+      const groups = groupsApi(env);
+      // NOW は 2026-11-19。毎月5日は、今月の予定日をすでに過ぎている。
+      const result = await api.create(f.alice, f.groupId, body(f, { dayOfMonth: 5, split: { method: 'equal', memberIds: [f.alice.memberId, f.bob.memberId] } }));
+      assert.equal(result.body.thisMonthSkipped, true);
+      const id = result.body.recurringExpense.id;
+      assert.deepEqual(await runsOf(id), [{ scheduled_month: '2026-11', expense_id: null }]);
+      assert.equal((await groups.getGroup(f.alice, f.groupId)).body.group.currencyLocked, true);
+
+      const version = await versionOf(f.groupId);
+      assert.equal((await del(f.bob, id)).status, 204);
+      assert.equal(await rowOf(id), null);
+      assert.deepEqual(await runsOf(id), []);
+      assert.deepEqual(await allocationsOf(id), []);
+      assert.equal(await versionOf(f.groupId), version + 1);
+      assert.equal((await groups.getGroup(f.alice, f.groupId)).body.group.currencyLocked, false);
+    });
+
+    it('作らなかった記録と、支出を作った記録の両方があれば、消せない。何も消えない', async () => {
+      const f = await createFixture();
+      const { id } = await created(f);
+      await runRow(f.groupId, id, null, '2026-10');
+      await runRow(f.groupId, id, 'expense-made', '2026-11');
+      assert.equal((await del(f.alice, id)).status, 409);
+      assert.notEqual(await rowOf(id), null);
+      assert.equal((await runsOf(id)).length, 2);
     });
 
     it('消す間際に自動登録が作ったら、読み直して判定し直し、消さずに409', async () => {
@@ -791,6 +855,15 @@ describe('固定費のAPI', () => {
       const id = await insertRecurringRow(db, { groupId: f.groupId, categoryId: f.categoryId, payerMemberId: f.alice.memberId, dayOfMonth: 5 });
       const edited = await api.update(f.alice, id, { description: '直した', amountMinor: 70000 });
       assert.equal(edited.body.thisMonthSkipped, false);
+      assert.deepEqual(await skipRows(id), []);
+    });
+
+    it('アーカイブした費目の固定費の費目を選び直しても、記録しない（見送られていた今月の分は、次の自動登録が作る。費目を戻したときと同じ）', async () => {
+      const f = await createFixture();
+      const id = await insertRecurringRow(db, { groupId: f.groupId, categoryId: f.archivedCategoryId, payerMemberId: f.alice.memberId, dayOfMonth: 5 });
+      const fresh = await createFixture.addCategory(f.groupId, 'fresh');
+      const changed = await api.update(f.alice, id, { categoryId: fresh });
+      assert.deepEqual([changed.status, changed.body.thisMonthSkipped], [200, false]);
       assert.deepEqual(await skipRows(id), []);
     });
 

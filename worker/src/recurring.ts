@@ -145,7 +145,10 @@ function recurringJson(row: RecurringRow, split: SplitInput) {
 }
 type RecurringJson = ReturnType<typeof recurringJson>;
 
-/** 書き込みの応答。`thisMonthSkipped` は、今月の分を作らない記録を、この書き込みで残したか(アプリが案内する)。 */
+/**
+ * 書き込みの応答。`thisMonthSkipped` は、今月の分を作らない記録を、この書き込みで残したか(アプリが案内する)。
+ * 登録の再送(200)では、記録を残した書き込みではなく、今月の記録がいまあるか。
+ */
 interface WrittenRecurring {
   recurringExpense: RecurringJson;
   thisMonthSkipped: boolean;
@@ -366,7 +369,22 @@ export async function handleCreateRecurring(
       if (owner !== null) {
         if (owner.group_id !== groupId) return { reject: conflict('conflict') };
         const stored = await loadRecurringOne(db, groupId, input.id);
-        if (stored !== null) return { reject: json({ recurringExpense: recurringJson(stored.row, stored.split) }) };
+        if (stored !== null) {
+          // 通信が切れて再送したときこそ、「今月の分は作られない」案内が要る。最初の応答で伝えたはずの内容を、今月の
+          // 「作らなかった」記録から導いて返す(その後の変更が書いた記録も含む。「いま、今月の分は作られない」の意味)。
+          const skipped = await db
+            .prepare(
+              `SELECT 1 AS found FROM recurring_expense_runs
+                WHERE recurring_expense_id = ? AND scheduled_month = ? AND expense_id IS NULL`,
+            )
+            .bind(input.id, monthIn(access.group.timezone, now))
+            .first<{ found: number }>();
+          const written: WrittenRecurring = {
+            recurringExpense: recurringJson(stored.row, stored.split),
+            thisMonthSkipped: skipped !== null,
+          };
+          return { reject: json(written) };
+        }
       }
     }
 
@@ -585,9 +603,13 @@ export async function handleUpdateRecurring(
 // DELETE /recurring-expenses/:id
 
 /**
- * 一度も支出を作っていない(生成記録が無い)固定費だけ、物理削除できる。作った支出と生成記録が参照するので、一度でも
- * 作った固定費は消せない(止める・終了月を決める)。間違えて作った固定費が、上限(50件)と通貨のロックに残り続けないように。
- * 生成記録は、支出と同じ書き込みで作る(自動登録)ので、生成記録が無ければ、参照する支出も無い。
+ * 一度も支出を作っていない固定費だけ、物理削除できる。作った支出と生成記録が参照するので、一度でも作った固定費は
+ * 消せない(止める・終了月を決める)。間違えて作った固定費が、上限(50件)と通貨のロックに残り続けないように。
+ *
+ * 「作った」かは、生成記録の `expense_id` で見る(支出を作った記録。支出を消しても残る)。「今月の分は作らなかった」
+ * 記録(`expense_id` が `NULL`。予定日を過ぎてから登録・再開したときに残す)は、数えずに、固定費と一緒に消す
+ * (数えると、月の途中で登録した固定費が、ほとんど消せない)。生成記録は、支出と同じ書き込みで作る(自動登録)ので、
+ * 支出を作った記録が無ければ、参照する支出も無い。
  */
 export async function handleDeleteRecurring(
   request: Request,
@@ -611,7 +633,9 @@ export async function handleDeleteRecurring(
         .bind(recurringId, groupId)
         .first<{ found: number }>(),
       db
-        .prepare('SELECT 1 AS found FROM recurring_expense_runs WHERE recurring_expense_id = ? LIMIT 1')
+        .prepare(
+          'SELECT 1 AS found FROM recurring_expense_runs WHERE recurring_expense_id = ? AND expense_id IS NOT NULL LIMIT 1',
+        )
         .bind(recurringId)
         .first<{ found: number }>(),
     ]);
@@ -622,9 +646,15 @@ export async function handleDeleteRecurring(
 
     return {
       value: null,
-      // 負担設定(子)から先に消す。
+      // 子(負担設定・作らなかった記録)から先に消す。支出を作った記録は、上で無いことを確かめている。
       write: (token) => [
         deleteAllocationsStatement(db, token, groupId, recurringId),
+        db
+          .prepare(
+            `DELETE FROM recurring_expense_runs
+              WHERE recurring_expense_id = ? AND group_id = ? AND expense_id IS NULL AND EXISTS (${GROUP_WRITE_GUARD})`,
+          )
+          .bind(recurringId, groupId, groupId, token),
         db
           .prepare(`DELETE FROM recurring_expenses WHERE id = ? AND group_id = ? AND EXISTS (${GROUP_WRITE_GUARD})`)
           .bind(recurringId, groupId, groupId, token),
