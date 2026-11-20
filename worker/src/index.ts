@@ -30,6 +30,7 @@ import {
 } from './invites.ts';
 import { handleCancelLeave, handleRequestLeave } from './leave.ts';
 import { isMonth } from './months.ts';
+import { handleCreateRecurring, handleListRecurring, handleUpdateRecurring } from './recurring.ts';
 import { handleProcessTransfer } from './transfers.ts';
 
 const GROUPS_PATH = /^\/groups$/;
@@ -42,6 +43,8 @@ const GROUP_CATEGORY_RULES_PATH = /^\/groups\/([^/]+)\/months\/([^/]+)\/category
 const GROUP_CATEGORY_RULE_PATH = /^\/groups\/([^/]+)\/months\/([^/]+)\/category-shares\/([^/]+)$/;
 const GROUP_EXPENSES_PATH = /^\/groups\/([^/]+)\/expenses$/;
 const EXPENSE_PATH = /^\/expenses\/([^/]+)$/;
+const GROUP_RECURRING_PATH = /^\/groups\/([^/]+)\/recurring-expenses$/;
+const RECURRING_PATH = /^\/recurring-expenses\/([^/]+)$/;
 const GROUP_MONTH_PATH = /^\/groups\/([^/]+)\/months\/([^/]+)\/(summary|close|closing)$/;
 const TRANSFER_PATH = /^\/transfers\/([^/]+)\/(settle|carry)$/;
 const GROUP_INVITES_PATH = /^\/groups\/([^/]+)\/invites$/;
@@ -141,6 +144,23 @@ export default {
       if (request.method === 'PATCH') return handleUpdateExpense(request, env, now, expenseId);
       if (request.method === 'DELETE') return handleDeleteExpense(request, env, now, expenseId);
       return methodNotAllowed('PATCH, DELETE');
+    }
+
+    const groupRecurring = GROUP_RECURRING_PATH.exec(pathname);
+    if (groupRecurring !== null) {
+      const groupId = groupRecurring[1]!;
+      if (!isId(groupId)) return notFound();
+      if (request.method === 'GET') return handleListRecurring(request, env, now, groupId);
+      if (request.method === 'POST') return handleCreateRecurring(request, env, now, groupId);
+      return methodNotAllowed('GET, POST');
+    }
+
+    const recurring = RECURRING_PATH.exec(pathname);
+    if (recurring !== null) {
+      const recurringId = recurring[1]!;
+      if (!isId(recurringId)) return notFound();
+      if (request.method === 'PATCH') return handleUpdateRecurring(request, env, now, recurringId);
+      return methodNotAllowed('PATCH');
     }
 
     const groupMonth = GROUP_MONTH_PATH.exec(pathname);

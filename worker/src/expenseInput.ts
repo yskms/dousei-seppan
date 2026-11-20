@@ -88,7 +88,7 @@ export function codePointLength(text: string): number {
 }
 
 /** 内容。前後の空白は落とし、空なら null。 */
-function parseDescription(value: unknown): ParseResult<string | null> {
+export function parseDescription(value: unknown): ParseResult<string | null> {
   if (value === null) return { ok: true, value: null };
   if (typeof value !== 'string') return fail('description');
   const trimmed = value.trim();
@@ -96,10 +96,10 @@ function parseDescription(value: unknown): ParseResult<string | null> {
   return { ok: true, value: trimmed === '' ? null : trimmed };
 }
 
-const isAmount = (value: unknown): value is number =>
+export const isAmount = (value: unknown): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 && value <= MAX_AMOUNT_MINOR;
 
-function parseSplit(value: unknown): ParseResult<SplitInput> {
+export function parseSplit(value: unknown): ParseResult<SplitInput> {
   if (!isRecord(value)) return fail('split');
   switch (value.method) {
     case 'category': {

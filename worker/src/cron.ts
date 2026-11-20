@@ -1,10 +1,13 @@
 // 定期処理（Cron Triggers）。設計は docs/backend-design.md 7章。1時間ごとに動かし、グループのタイムゾーンで日付を
 // 判定する。処理はすべて冪等（同じ時刻に2回動いても、結果が変わらない）。
 //
-// いま入っているのは、月初の処理（脱退月が終わったのに締められていない脱退の確定。5章）。固定費の自動登録は、
-// 固定費のAPIと一緒に足す（7章）。確定の中身は membership.ts の `confirmEndedLeaves`（月締めも使う）。
+// 入っている処理は2つ。順番に意味がある（1つ目の確定が済んでから、2つ目が固定費を読む）。
+// 1. 月初の処理（脱退月が終わったのに締められていない脱退の確定。5章）。確定の中身は membership.ts の
+//    `confirmEndedLeaves`（月締めも使う）。固定費の停止（`payer_left`・`member_changed`）もここで書く。
+// 2. 固定費の自動登録（7章。src/recurringRun.ts）。1つ目で止まった固定費を、読み直して見送る。
 import { confirmEndedLeaves } from './membership.ts';
 import { monthIn } from './months.ts';
+import { registerDueRecurring, type RecurringRunSummary } from './recurringRun.ts';
 
 /**
  * 1回の実行で使うD1のクエリ数の予算。D1は batch の1文も1クエリと数え、Freeは1回の呼び出しにつき50まで
@@ -31,7 +34,9 @@ export interface CronSummary {
   failedGroups: string[];
   /** 予算が尽きて、この回は手を付けなかったグループ。 */
   postponedGroups: string[];
-  /** この回が使ったD1のクエリ数（探す1回と、グループごとの読み込み・書き込み）。 */
+  /** 固定費の自動登録（7章）。 */
+  recurring: RecurringRunSummary;
+  /** この回が使ったD1のクエリ数（脱退の確定と、固定費の自動登録の、探す1回と、グループごとの読み込み・書き込み）。 */
   queries: number;
 }
 
@@ -74,6 +79,15 @@ export async function runScheduled(env: Env, now: number, queryBudget = QUERY_BU
     deferredGroups: [],
     failedGroups: [],
     postponedGroups: [],
+    recurring: {
+      createdGroups: [],
+      createdExpenses: 0,
+      deferredGroups: [],
+      failedGroups: [],
+      postponedGroups: [],
+      skipped: false,
+      queries: 0,
+    },
     queries: 1, // 探す1回
   };
   let largest = 0;
@@ -96,8 +110,12 @@ export async function runScheduled(env: Env, now: number, queryBudget = QUERY_BU
       summary.queries += Math.max(largest, 1);
     }
   }
-  if (summary.failedGroups.length > 0) {
-    throw new Error(`定期処理で失敗したグループがある: ${summary.failedGroups.length}件`);
-  }
+
+  // 固定費の自動登録は、脱退の確定（固定費の停止を含む）のあとに行う。予算が余っていなければ、この回は見送る。
+  summary.recurring = await registerDueRecurring(env.DB, now, summary.queries, queryBudget);
+  summary.queries += summary.recurring.queries;
+
+  const failed = summary.failedGroups.length + summary.recurring.failedGroups.length;
+  if (failed > 0) throw new Error(`定期処理で失敗したグループがある: ${failed}件`);
   return summary;
 }

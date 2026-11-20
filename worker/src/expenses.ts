@@ -63,7 +63,7 @@ const EXPENSE_COLUMNS = `id, group_id, expense_date, target_month, description, 
   payer_member_id, created_by_member_id, split_method, recurring_expense_id, created_at, updated_at`;
 
 /** `category` 以外の支出の、メンバーごとの確定負担額（3章）。 */
-interface Allocation {
+export interface Allocation {
   memberId: string;
   burdenMinor: number;
   /** 割合指定（ratio）のときだけ入る。 */
@@ -106,7 +106,7 @@ type ExpenseJson = ReturnType<typeof expenseJson>;
 // ---------------------------------------------------------------------------
 // 読み取り（検証用）
 
-interface MemberRow {
+export interface MemberRow {
   id: string;
   status: 'active' | 'leaving' | 'left' | 'deleted';
   history_from_month: string;
@@ -115,7 +115,7 @@ interface MemberRow {
 }
 
 /** グループの全メンバー（少人数。IN句のバインド数の上限を避けるため、まとめて読む）。 */
-async function loadMembers(db: D1Database, groupId: string): Promise<Map<string, MemberRow>> {
+export async function loadMembers(db: D1Database, groupId: string): Promise<Map<string, MemberRow>> {
   const { results } = await db
     .prepare(
       `SELECT id, status, history_from_month, expense_end_month, leave_requested_month
@@ -134,7 +134,7 @@ async function loadMembers(db: D1Database, groupId: string): Promise<Map<string,
  * Cronが動くまでの間、翌月の支出に入ってしまう（あとで確定しても、保存した個別の負担額は戻らない）。
  * 脱退月までは選べる（脱退月の支出を、脱退者の支払として登録できるように）。
  */
-function isMemberAvailable(member: MemberRow, month: string): boolean {
+export function isMemberAvailable(member: MemberRow, month: string): boolean {
   if (member.status === 'deleted' || member.status === 'left') return false;
   if (month < member.history_from_month) return false;
   const lastMonth = member.expense_end_month ?? member.leave_requested_month;
@@ -142,7 +142,7 @@ function isMemberAvailable(member: MemberRow, month: string): boolean {
   return true;
 }
 
-interface MemberRef {
+export interface MemberRef {
   id: string;
   /** 失敗したときに返す項目名。 */
   field: string;
@@ -153,7 +153,7 @@ interface MemberRef {
 /**
  * グループに居て（居なければ400。他グループのIDなど）、見る指定のものは、その月に使えるメンバーか（使えなければ409）。
  */
-function checkMembers(members: Map<string, MemberRow>, refs: readonly MemberRef[], month: string): Response | null {
+export function checkMembers(members: Map<string, MemberRow>, refs: readonly MemberRef[], month: string): Response | null {
   for (const ref of refs) {
     const member = members.get(ref.id);
     if (member === undefined) return invalidRequest(ref.field);
@@ -215,7 +215,7 @@ async function registerableMonths(
 }
 
 /** 送られた通貨が、グループの通貨と違う。アプリは、グループ情報を読み直して、金額を入れ直してもらう。 */
-const currencyMismatch = (currencyCode: string): Response => conflict('currency_mismatch', { currencyCode });
+export const currencyMismatch = (currencyCode: string): Response => conflict('currency_mismatch', { currencyCode });
 
 const monthNotRegisterable = (range: { from: string; to: string }): Response =>
   conflict('month_not_registerable', { from: range.from, to: range.to });
@@ -224,7 +224,7 @@ const monthNotRegisterable = (range: { from: string; to: string }): Response =>
 // 負担額（個別設定）
 
 /** 負担の指定に出てくるメンバーと、不備のときに返す項目名（`split.shares` など。入力の形と揃える）。 */
-function splitMemberRefs(split: SplitInput): { id: string; field: string }[] {
+export function splitMemberRefs(split: SplitInput): { id: string; field: string }[] {
   switch (split.method) {
     case 'category':
       return [];
@@ -240,7 +240,7 @@ function splitMemberRefs(split: SplitInput): { id: string; field: string }[] {
 }
 
 /** 個別設定の負担額を計算する（`category` は []）。金額指定の合計が金額と合わなければ、項目名を返す。 */
-function buildAllocations(
+export function buildAllocations(
   amountMinor: number,
   split: SplitInput,
 ): { ok: true; allocations: Allocation[] } | { ok: false; field: string } {
@@ -349,7 +349,7 @@ function deleteExpenseStatement(db: D1Database, token: string, groupId: string, 
 }
 
 /** 書き込めなかった結果の応答（成功以外）。 */
-function failureResponse(outcome: Exclude<GroupWriteOutcome<unknown, Response>, { status: 'written' }>): Response {
+export function failureResponse(outcome: Exclude<GroupWriteOutcome<unknown, Response>, { status: 'written' }>): Response {
   switch (outcome.status) {
     case 'rejected':
       return outcome.reject;

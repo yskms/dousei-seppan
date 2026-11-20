@@ -1,7 +1,17 @@
 /// <reference types="node" />
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { isDate, isMonth, maxMonth, monthIn, nextMonth, registerableRange } from '../src/months.ts';
+import {
+  dateIn,
+  daysInMonth,
+  isDate,
+  isMonth,
+  maxMonth,
+  monthIn,
+  nextMonth,
+  registerableRange,
+  scheduledDate,
+} from '../src/months.ts';
 
 describe('isMonth', () => {
   it('YYYY-MM だけを通す', () => {
@@ -94,5 +104,40 @@ describe('registerableRange（8章「支出の対象月」）', () => {
       registerableRange({ createdMonth: '2026-08', currentMonth: '2026-12', latestClosedMonth: '2026-12' }),
       { from: '2027-01', to: '2027-01' },
     );
+  });
+});
+
+describe('dateIn', () => {
+  it('タイムゾーンの日付を返す。UTCと日付がずれる時刻でも、タイムゾーンの日付', () => {
+    // 2026-11-30 15:30 UTC は、東京では 12-01 00:30、ロサンゼルスでは 11-30 07:30。
+    const now = Date.UTC(2026, 10, 30, 15, 30, 0);
+    assert.equal(dateIn('Asia/Tokyo', now), '2026-12-01');
+    assert.equal(dateIn('America/Los_Angeles', now), '2026-11-30');
+    assert.equal(dateIn('UTC', now), '2026-11-30');
+    assert.equal(monthIn('Asia/Tokyo', now), '2026-12');
+  });
+});
+
+describe('daysInMonth・scheduledDate（固定費の予定日。7章）', () => {
+  it('月の日数（うるう年を含む）', () => {
+    assert.equal(daysInMonth('2026-01'), 31);
+    assert.equal(daysInMonth('2026-04'), 30);
+    assert.equal(daysInMonth('2026-02'), 28);
+    assert.equal(daysInMonth('2028-02'), 29);
+    assert.equal(daysInMonth('2100-02'), 28);
+    assert.equal(daysInMonth('2000-02'), 29);
+    assert.equal(daysInMonth('2026-12'), 31);
+  });
+
+  it('その月に無い日は、月末日にする', () => {
+    assert.equal(scheduledDate('2026-11', 25), '2026-11-25');
+    assert.equal(scheduledDate('2026-11', 30), '2026-11-30');
+    assert.equal(scheduledDate('2026-11', 31), '2026-11-30');
+    assert.equal(scheduledDate('2026-04', 31), '2026-04-30');
+    assert.equal(scheduledDate('2026-02', 29), '2026-02-28');
+    assert.equal(scheduledDate('2028-02', 29), '2028-02-29');
+    assert.equal(scheduledDate('2028-02', 31), '2028-02-29');
+    assert.equal(scheduledDate('2026-12', 1), '2026-12-01');
+    assert.equal(scheduledDate('2026-10', 5), '2026-10-05');
   });
 });

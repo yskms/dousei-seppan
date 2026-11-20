@@ -324,7 +324,10 @@ export async function insertInviteRow(
   return { id, token };
 }
 
-/** 固定費のテンプレートを直接書く（固定費のAPIは、まだ無い）。 */
+/**
+ * 固定費のテンプレートを直接書く（固定費のAPIの検査は recurring.test.ts。ほかの検査では、行だけ作る）。
+ * 既定は、家賃80000円・毎月25日・2026-10から・止まっていない。
+ */
 export async function insertRecurringRow(
   db: D1Database,
   recurring: {
@@ -333,26 +336,47 @@ export async function insertRecurringRow(
     payerMemberId: string;
     splitMethod?: 'category' | 'equal' | 'ratio' | 'fixed' | 'single';
     pausedReason?: 'member_changed' | 'payer_left' | 'manual' | null;
+    description?: string | null;
+    amountMinor?: number;
+    dayOfMonth?: number;
+    startMonth?: string;
+    endMonth?: string | null;
+    /** `category` 以外のとき、メンバーごとの個別の負担設定（割合は1万分率、金額指定は金額。均等・単独は両方 null）。 */
+    allocations?: readonly (readonly [memberId: string, basisPoints: number | null, amountMinor: number | null])[];
   },
 ): Promise<string> {
   const id = `recurring-${++seq}`;
-  await db
-    .prepare(
-      `INSERT INTO recurring_expenses (id, group_id, description, amount_minor, category_id, payer_member_id,
-         split_method, day_of_month, start_month, paused_at, paused_reason, created_at, updated_at)
-       VALUES (?, ?, '家賃', 80000, ?, ?, ?, 25, '2026-10', ?, ?, ?, ?)`,
-    )
-    .bind(
-      id,
-      recurring.groupId,
-      recurring.categoryId,
-      recurring.payerMemberId,
-      recurring.splitMethod ?? 'category',
-      recurring.pausedReason == null ? null : NOW,
-      recurring.pausedReason ?? null,
-      NOW,
-      NOW,
-    )
-    .run();
+  await db.batch([
+    db
+      .prepare(
+        `INSERT INTO recurring_expenses (id, group_id, description, amount_minor, category_id, payer_member_id,
+           split_method, day_of_month, start_month, end_month, paused_at, paused_reason, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(
+        id,
+        recurring.groupId,
+        recurring.description === undefined ? '家賃' : recurring.description,
+        recurring.amountMinor ?? 80000,
+        recurring.categoryId,
+        recurring.payerMemberId,
+        recurring.splitMethod ?? 'category',
+        recurring.dayOfMonth ?? 25,
+        recurring.startMonth ?? '2026-10',
+        recurring.endMonth ?? null,
+        recurring.pausedReason == null ? null : NOW,
+        recurring.pausedReason ?? null,
+        NOW,
+        NOW,
+      ),
+    ...(recurring.allocations ?? []).map(([memberId, basisPoints, amountMinor]) =>
+      db
+        .prepare(
+          `INSERT INTO recurring_expense_allocations (group_id, recurring_expense_id, member_id, share_basis_points, amount_minor)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        .bind(recurring.groupId, id, memberId, basisPoints, amountMinor),
+    ),
+  ]);
   return id;
 }

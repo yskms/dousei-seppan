@@ -70,3 +70,35 @@ export function registerableRange(input: {
   const from = input.latestClosedMonth === null ? input.createdMonth : nextMonth(input.latestClosedMonth);
   return { from, to: maxMonth(from, input.currentMonth) };
 }
+
+/** `now`（Unixエポックのミリ秒）が属する日付（`YYYY-MM-DD`）を、タイムゾーン（IANA名）で求める。 */
+export function dateIn(timezone: string, now: number): string {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(now);
+  const year = parts.find((part) => part.type === 'year')?.value;
+  const month = parts.find((part) => part.type === 'month')?.value;
+  const day = parts.find((part) => part.type === 'day')?.value;
+  if (year === undefined || month === undefined || day === undefined) throw new Error(`日付を求められない: ${timezone}`);
+  return `${year.padStart(4, '0')}-${month}-${day}`;
+}
+
+/** その月の日数（うるう年を含む）。 */
+export function daysInMonth(month: string): number {
+  const match = MONTH_PATTERN.exec(month);
+  if (match === null) throw new Error(`月の形式が違う: ${month}`);
+  // 翌月の0日目 = その月の末日。setUTCFullYear は、0〜99年を1900年代に読み替えない。
+  const date = new Date(0);
+  date.setUTCFullYear(Number(match[1]), Number(match[2]), 0);
+  return date.getUTCDate();
+}
+
+/**
+ * 固定費の予定日（`YYYY-MM-DD`）。`dayOfMonth` がその月の日数より大きければ、月末日（docs/backend-design.md 7章）。
+ */
+export function scheduledDate(month: string, dayOfMonth: number): string {
+  return `${month}-${String(Math.min(dayOfMonth, daysInMonth(month))).padStart(2, '0')}`;
+}

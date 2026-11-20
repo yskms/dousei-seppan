@@ -22,3 +22,10 @@ export const MAX_CATEGORY_NAME_LENGTH = 20;
  * 上限やメンバー数を増やすときは、worker/test/closings.test.ts の「費目の上限(30)・メンバー6人」を測り直す）。
  */
 export const MAX_CATEGORIES_PER_GROUP = 30;
+
+/**
+ * 1つのグループが持てる固定費の数（終了・停止したものを含む。テンプレートは物理削除しない）。仮の値。
+ * 自動登録のCronは、グループごとに全テンプレートを読み、1回の書き込みにまとめる（docs/backend-design.md 7章）ので、
+ * 上限は、その1回のD1のクエリ数がFreeの上限（50）に収まる大きさにする。
+ */
+export const MAX_RECURRING_EXPENSES_PER_GROUP = 50;
