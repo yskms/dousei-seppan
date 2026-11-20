@@ -29,6 +29,7 @@ import {
   isInviteToken,
 } from './invites.ts';
 import { handleCancelLeave, handleRequestLeave } from './leave.ts';
+import { handleListMonths } from './monthList.ts';
 import { isMonth } from './months.ts';
 import { handleCreateRecurring, handleDeleteRecurring, handleListRecurring, handleUpdateRecurring } from './recurring.ts';
 import { handleProcessTransfer } from './transfers.ts';
@@ -45,7 +46,8 @@ const GROUP_EXPENSES_PATH = /^\/groups\/([^/]+)\/expenses$/;
 const EXPENSE_PATH = /^\/expenses\/([^/]+)$/;
 const GROUP_RECURRING_PATH = /^\/groups\/([^/]+)\/recurring-expenses$/;
 const RECURRING_PATH = /^\/recurring-expenses\/([^/]+)$/;
-const GROUP_MONTH_PATH = /^\/groups\/([^/]+)\/months\/([^/]+)\/(summary|close|closing)$/;
+const GROUP_MONTHS_PATH = /^\/groups\/([^/]+)\/months$/;
+const GROUP_MONTH_PATH =/^\/groups\/([^/]+)\/months\/([^/]+)\/(summary|close|closing)$/;
 const TRANSFER_PATH = /^\/transfers\/([^/]+)\/(settle|carry)$/;
 const GROUP_INVITES_PATH = /^\/groups\/([^/]+)\/invites$/;
 const GROUP_LEAVE_PATH = /^\/groups\/([^/]+)\/leave$/;
@@ -162,6 +164,14 @@ export default {
       if (request.method === 'PATCH') return handleUpdateRecurring(request, env, now, recurringId);
       if (request.method === 'DELETE') return handleDeleteRecurring(request, env, now, recurringId);
       return methodNotAllowed('PATCH, DELETE');
+    }
+
+    const groupMonths = GROUP_MONTHS_PATH.exec(pathname);
+    if (groupMonths !== null) {
+      const groupId = groupMonths[1]!;
+      if (!isId(groupId)) return notFound();
+      if (request.method === 'GET') return handleListMonths(request, env, now, groupId);
+      return methodNotAllowed('GET');
     }
 
     const groupMonth = GROUP_MONTH_PATH.exec(pathname);

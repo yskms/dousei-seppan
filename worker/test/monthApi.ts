@@ -1,5 +1,6 @@
 // 月次集計・月締め・精算のAPIのテストで使う、呼び出しの道具。
 import { handleCloseMonth, handleGetClosing, handleMonthSummary } from '../src/closings.ts';
+import { handleListMonths } from '../src/monthList.ts';
 import { handleProcessTransfer } from '../src/transfers.ts';
 import { NOW, type Person } from './apiFixture.ts';
 
@@ -34,6 +35,15 @@ interface Options {
 /** 各APIの呼び出し。`who` が null なら、セッション無し。 */
 export function monthApi(defaultEnv: Env) {
   return {
+    months: async (who: Person | null, groupId: string, options: Options = {}) =>
+      read(
+        await handleListMonths(
+          request('GET', `/groups/${groupId}/months`, who?.token ?? null),
+          options.env ?? defaultEnv,
+          options.now ?? NOW,
+          groupId,
+        ),
+      ),
     summary: async (who: Person | null, groupId: string, month: string, options: Options = {}) =>
       read(
         await handleMonthSummary(
