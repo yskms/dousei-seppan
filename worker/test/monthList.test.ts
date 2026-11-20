@@ -205,6 +205,39 @@ describe('月の一覧API', () => {
     assert.deepEqual(statuses(result), ['2026-10:open', '2026-11:open']);
   });
 
+  it('脱退月が終わっても、脱退が確定したメンバーには、脱退月より後の月も並ぶ（繰越先の月を開いて精算するため。5章）', async () => {
+    // carol の脱退月は2026-10。2026-10を締めて、carol が関わる送金が未処理のまま、今は2026-11。
+    const g = await setup(['alice', 'carol'], { carol: { status: 'leaving', expenseEndMonth: '2026-10' } });
+    const { alice, carol } = g.people;
+    await pay(g, alice, 10000);
+    assert.equal((await api.close(alice, g.groupId, '2026-10')).status, 201);
+
+    const result = await api.months(carol, g.groupId);
+    assert.equal(result.status, 200);
+    assert.deepEqual(statuses(result), ['2026-10:unsettled', '2026-11:open']);
+    // 並ぶ月は、summary でも見られる（上のとおり、上端は脱退月で切らない）。
+    assert.equal((await api.summary(carol, g.groupId, '2026-11')).status, 200);
+  });
+
+  it('一覧に並ぶ月は、すべて summary で見られる月（canViewMonth と同じ範囲）。その前の月は見られない', async () => {
+    const g = await setup(['alice', 'newbie'], { newbie: { historyFromMonth: '2026-11' } });
+    const { alice, newbie } = g.people;
+    await pay(g, alice, 10000);
+    assert.equal((await api.close(alice, g.groupId, '2026-10')).status, 201);
+
+    for (const who of [alice, newbie]) {
+      const list = await api.months(who, g.groupId, { now: NOW_DECEMBER });
+      assert.ok(list.body.months.length > 0);
+      for (const entry of list.body.months) {
+        assert.equal((await api.summary(who, g.groupId, entry.month, { now: NOW_DECEMBER })).status, 200, entry.month);
+      }
+    }
+    // newbie の一覧の最初は2026-11。その前の月（2026-10）は、summary でも見られない。
+    const first = (await api.months(newbie, g.groupId)).body.months[0].month;
+    assert.equal(first, '2026-11');
+    assert.equal((await api.summary(newbie, g.groupId, '2026-10')).status, 403);
+  });
+
   it('グループが無い・メンバーでない・脱退済み・他のグループのIDは、区別せず404', async () => {
     const f = await factory();
     const missing = await api.months(f.alice, 'no-such-group');

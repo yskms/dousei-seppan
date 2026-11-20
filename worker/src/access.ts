@@ -87,7 +87,13 @@ export async function loadGroupAccess(db: D1Database, userId: string, groupId: s
   };
 }
 
-/** その月のデータを見てよいか。新しいメンバーが見られるのは、参加（復帰）した月以降（5章）。 */
+/**
+ * その月のデータを見てよいか。新しいメンバーが見られるのは、参加（復帰）した月以降（5章）。
+ *
+ * 月の一覧（monthList.ts）が並べる月の始まりも、この判定と同じ（`historyFromMonth`）。閲覧期間の制限を足すときは、
+ * 一覧も合わせる（screens.md 3章は、見られない月を、鍵の印つきでピッカーに並べる想定）。一覧に並ぶ月が、すべて
+ * この関数を通ることは、`worker/test/monthList.test.ts` で確かめている。
+ */
 export function canViewMonth(access: GroupAccess, month: string): boolean {
   return month >= access.member.historyFromMonth;
 }
