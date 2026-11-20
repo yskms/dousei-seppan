@@ -2,34 +2,30 @@
 // 判定する。処理はすべて冪等（同じ時刻に2回動いても、結果が変わらない）。
 //
 // いま入っているのは、月初の処理（脱退月が終わったのに締められていない脱退の確定。5章）。固定費の自動登録は、
-// 固定費のAPIと一緒に足す（7章）。
-import { latestClosedMonth } from './access.ts';
-import { markLeftStatement } from './closedMonth.ts';
-import { readDataVersion, writeToGroup } from './groupWrite.ts';
-import {
-  confirmLeaveStatements,
-  deleteGroupStatements,
-  dueLeaves,
-  isLastMember,
-  loadCategoryIds,
-  loadMembers,
-} from './membership.ts';
+// 固定費のAPIと一緒に足す（7章）。確定の中身は membership.ts の `confirmEndedLeaves`（月締めも使う）。
+import { confirmEndedLeaves } from './membership.ts';
 import { monthIn } from './months.ts';
 
 /**
- * 1回の実行で確定させるグループの数の上限。D1のクエリ数（Freeは1回の呼び出しにつき50）と、1回の実行の長さを
- * 抑えるため。残りは、次の時間の実行が引き受ける（APIは、脱退月が終わったメンバーを、確定したものとして扱う。
- * access.ts の `isLeaveEffective`）ので、遅れても利用者の見える挙動は変わらない。公開時にPaidへ移すときに見直す。
+ * 1回の実行で使うD1のクエリ数の予算。D1は batch の1文も1クエリと数え、Freeは1回の呼び出しにつき50まで
+ * （Paidは1000）。グループを1つ確定させるごとに約15クエリ使う（読み込み5〜6、書き込み約10。`worker/test/cron.test.ts`
+ * で数えている）ので、Freeでは、1回に3グループほど。残りは次の回が引き受ける（APIは、脱退月が終わったメンバーを
+ * 確定したものとして扱う。access.ts の `isLeaveEffective`）ので、遅れても、利用者の見える挙動は変わらない。
+ * **公開時にPaidへ移すときに、1000に近い値へ上げる。**
  */
-export const MAX_GROUPS_PER_RUN = 20;
+export const QUERY_BUDGET_PER_RUN = 50;
 
 export interface CronSummary {
-  /** 脱退を確定させたグループ。 */
+  /** 脱退を確定させたグループ（最後の1人の脱退で、削除したグループを含む）。 */
   confirmedGroups: string[];
   /** 他の書き込みと競合したので、次の回に回したグループ（何も変更していない）。 */
   deferredGroups: string[];
   /** 想定外のエラーで確定できなかったグループ。 */
   failedGroups: string[];
+  /** 予算が尽きて、この回は手を付けなかったグループ。 */
+  postponedGroups: string[];
+  /** この回が使ったD1のクエリ数（探す1回と、グループごとの読み込み・書き込み）。 */
+  queries: number;
 }
 
 /**
@@ -56,62 +52,40 @@ async function findGroupsWithDueLeaves(db: D1Database, now: number): Promise<str
     .map(([groupId]) => groupId);
 }
 
-type GroupResult = 'confirmed' | 'deferred' | 'nothing';
-
-/** 1つのグループの、月が終わった脱退を確定させる。バージョンを先に読み、そのあとでデータを読む（8章）。 */
-async function confirmDueLeavesInGroup(db: D1Database, groupId: string, now: number): Promise<GroupResult> {
-  const version = await readDataVersion(db, groupId);
-  if (version === null) return 'nothing';
-  const group = await db
-    .prepare('SELECT timezone FROM expense_groups WHERE id = ?')
-    .bind(groupId)
-    .first<{ timezone: string }>();
-  if (group === null) return 'nothing';
-  const members = await loadMembers(db, groupId);
-  // グループの今月より前の月を脱退月に選んだメンバー（月が終わったもの）。
-  const currentMonth = monthIn(group.timezone, now);
-  const due = dueLeaves(members, currentMonth).filter((member) => member.leaveRequestedMonth! < currentMonth);
-  if (due.length === 0) return 'nothing';
-  // 最後の1人の脱退は、確定と同時に、グループのデータをすべて消す（5章「グループの削除」）。
-  const lastMember = isLastMember(members, due);
-  const categoryIds = lastMember ? [] : await loadCategoryIds(db, groupId);
-  const closedThrough = lastMember ? null : await latestClosedMonth(db, groupId);
-
-  const written = await writeToGroup(db, groupId, version, (token) =>
-    lastMember
-      ? deleteGroupStatements(db, token, groupId)
-      : [
-          ...confirmLeaveStatements(db, token, groupId, now, members, due, categoryIds, closedThrough),
-          // 脱退月がすでに締められていれば、送金が済んでいるメンバーは、そのまま脱退済みになる。
-          markLeftStatement(
-            db,
-            token,
-            groupId,
-            now,
-            due.map((member) => member.id),
-          ),
-        ],
-  );
-  if (written.ok) return 'confirmed';
-  // 'version': 利用者の操作と競合した。やり直さず、次の時間に回す（Cronは1時間ごとで冪等）。
-  if (written.reason === 'version') return 'deferred';
-  // 'unique': 確定の書き込みには、一意制約に触れる文が無い。出たら実装の誤りなので、握りつぶさない。
-  throw new Error('脱退の確定で、想定外の一意制約違反');
-}
-
-/** 1時間ごとの定期処理。`now` は予定の時刻（Unixエポックのミリ秒）。失敗したグループがあれば、最後に投げる。 */
-export async function runScheduled(env: Env, now: number): Promise<CronSummary> {
-  const summary: CronSummary = { confirmedGroups: [], deferredGroups: [], failedGroups: [] };
-  const groupIds = (await findGroupsWithDueLeaves(env.DB, now)).slice(0, MAX_GROUPS_PER_RUN);
-  for (const groupId of groupIds) {
+/**
+ * 1時間ごとの定期処理。`now` は予定の時刻（Unixエポックのミリ秒）。失敗したグループがあれば、最後に投げる。
+ *
+ * グループは、古い月のものから。1つ目は、予算を超えても必ず処理する（そうしないと、1つのグループの費用が予算より大きいとき、
+ * 永久に進まない）。2つ目からは、いままでに使った数と、これまでで最も大きかった1グループの費用の合計が、予算に収まるときだけ。
+ * 予算を超えるグループは、`postponedGroups` として、次の回に回す。
+ */
+export async function runScheduled(env: Env, now: number, queryBudget = QUERY_BUDGET_PER_RUN): Promise<CronSummary> {
+  const groupIds = await findGroupsWithDueLeaves(env.DB, now);
+  const summary: CronSummary = {
+    confirmedGroups: [],
+    deferredGroups: [],
+    failedGroups: [],
+    postponedGroups: [],
+    queries: 1, // 探す1回
+  };
+  let largest = 0;
+  for (const [index, groupId] of groupIds.entries()) {
+    if (index > 0 && summary.queries + largest > queryBudget) {
+      summary.postponedGroups.push(groupId);
+      continue;
+    }
     try {
-      const result = await confirmDueLeavesInGroup(env.DB, groupId, now);
-      if (result === 'confirmed') summary.confirmedGroups.push(groupId);
+      const { result, queries } = await confirmEndedLeaves(env.DB, groupId, now);
+      summary.queries += queries;
+      largest = Math.max(largest, queries);
+      if (result === 'confirmed' || result === 'deleted') summary.confirmedGroups.push(groupId);
       if (result === 'deferred') summary.deferredGroups.push(groupId);
     } catch (error) {
       // 1つのグループの失敗で、ほかのグループを止めない。値（名前・金額など）はログに出さない。
       console.error('脱退の確定に失敗', groupId, error instanceof Error ? error.name : 'unknown');
       summary.failedGroups.push(groupId);
+      // 失敗した分のクエリ数は分からないので、最も大きい1グループと同じだけ使ったものとして、予算を減らす。
+      summary.queries += Math.max(largest, 1);
     }
   }
   if (summary.failedGroups.length > 0) {

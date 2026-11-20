@@ -757,6 +757,39 @@ describe('月次集計・月締め・締め結果のAPI', () => {
       });
     });
 
+    describe('D1のクエリ数: 脱退の確定を含む月締め', () => {
+      // 脱退の確定が入ると、費目・割合の行がある月の読み込み2回と、割合のリセット（削除2文と複数行の挿入）・招待の取り消し・
+      // 固定費の停止・状態の更新の、約10文が増える（確定が無い月締めは、費目13・メンバー3で約25。docs 9章）。
+      const closeWithLeaver = async (categoryCount: number) => {
+        const g = await setup(['alice', 'bob', 'carol'], { alice: { leaveRequestedMonth: '2026-10' } });
+        const ids = [g.people.alice, g.people.bob, g.people.carol].map((p) => p.memberId);
+        const categoryIds = [g.categoryId];
+        for (let i = 1; i < categoryCount; i += 1) {
+          const categoryId = await factory.addCategory(g.groupId, `c${i}`);
+          await insertCategoryRule(db, g.groupId, categoryId, '2026-10', equalShares(ids));
+          categoryIds.push(categoryId);
+        }
+        for (const categoryId of categoryIds) await pay(g, g.people.bob, 3000, '2026-10', undefined, categoryId);
+        const counting = countingEnv(env);
+        const closed = await api.close(g.people.bob, g.groupId, '2026-10', { env: counting.env });
+        assert.equal(closed.status, 201, JSON.stringify(closed.body));
+        assert.equal((await count('category_month_shares', g.groupId)) >= categoryCount * 2, true, 'リセットで、翌月の割合が書かれた');
+        return counting.counts;
+      };
+
+      it('費目1つ・メンバー3人: 実測34（状態の読み込み10・書き込み14・結果の読み込み5と、認証・バージョン・権限など）', async () => {
+        const counts = await closeWithLeaver(1);
+        assert.deepEqual(counts.batchSizes, [10, 14, 5]);
+        assert.ok(counts.queries <= 40, `クエリ数 ${counts.queries}`);
+      });
+
+      it('費目13・メンバー3人: 実測37。複数行を1文にまとめているので、費目が増えても、ほとんど増えない', async () => {
+        const counts = await closeWithLeaver(13);
+        assert.deepEqual(counts.batchSizes, [10, 17, 5]);
+        assert.ok(counts.queries <= 42, `クエリ数 ${counts.queries}`);
+      });
+    });
+
     describe('脱退が確定したメンバー（5章）', () => {
       it('関わる送金が0件なら、締めた時点で脱退済みになる', async () => {
         const g = await factory.createGroup(['alice', 'bob', 'carol'], { carol: { status: 'leaving', expenseEndMonth: '2026-10' } });

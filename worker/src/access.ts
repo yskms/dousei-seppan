@@ -115,9 +115,20 @@ export function participatesInMonth(
  * 脱退予定のメンバーが翌月の支出を記録したり、招待を発行したりできてしまう。5章）。
  */
 export function isLeaveEffective(access: GroupAccess, now: number): boolean {
-  if (access.member.status !== 'active') return true;
-  const leaveMonth = access.member.leaveRequestedMonth;
-  return leaveMonth !== null && monthIn(access.group.timezone, now) > leaveMonth;
+  return isLeaveEffectiveFor(access.member, access.group.timezone, now);
+}
+
+/**
+ * `isLeaveEffective` の中身。`GroupAccess` を持たない呼び出し（招待の発行者が、まだ招待を発行できる状態か。invites.ts）が、
+ * 同じ判定を使うための関数。確定の扱いを、経路ごとに書き写さない（`access.ts` を直したときに、ずれるため）。
+ */
+export function isLeaveEffectiveFor(
+  member: { status: string; leaveRequestedMonth: string | null },
+  timezone: string,
+  now: number,
+): boolean {
+  if (member.status !== 'active') return true;
+  return member.leaveRequestedMonth !== null && monthIn(timezone, now) > member.leaveRequestedMonth;
 }
 
 /** 支出を記録（登録・編集・削除）してよいか。脱退が確定したメンバーは記録できない（5章）。 */

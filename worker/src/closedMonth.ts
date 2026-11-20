@@ -45,7 +45,11 @@ export function transferJson(row: TransferRow, canCarry: boolean) {
  * 脱退が確定した（`leaving`）メンバーを、脱退済み（`left`）にする文（5章「脱退」の4）。
  * 次をすべて満たすときだけ変わる。月締め（送金が0件なら、締めた時点で脱退済み）と、精算の処理の中で呼ぶ。
  * `memberIds` を渡せば、そのメンバーだけが対象。
- * - 脱退月が締められている。
+ * - 脱退月が締められている。または、脱退月より後の月がすでに締められている（脱退月が、最初の締めで飛ばされた月。
+ *   飛ばした月は、あとから締められないので、待ち続けても `left` にならない。4章）。
+ * - 脱退月より後の、まだ締めていない月の支出に、そのメンバーが支払者・負担の対象として関わっていない。脱退を選ぶ前に
+ *   （今月を早めに締めたあと）登録された翌月の支出に関わっていると、翌月を締めたときに、そのメンバーが関わる送金が
+ *   できる。`left` にしていると、本人は見られず、精算できない（繰越と同じ。下）。
  * - そのメンバーが関わる未処理（pending）の送金が無い。
  * - そのメンバーが関わる繰越済み（carried）の送金は、繰越先（締めた月の翌月）がすでに締められている。繰り越した額は、
  *   翌月を締めるまで、どの送金にも入っていない（翌月の締めで、送金に作り直される）。翌月が未締めのうちに脱退済みに
@@ -65,7 +69,14 @@ export function markLeftStatement(
       `UPDATE group_members SET status = 'left', left_at = ?
         WHERE group_id = ? AND status = 'leaving' ${idFilter}
           AND EXISTS (SELECT 1 FROM monthly_closings c
-                       WHERE c.group_id = group_members.group_id AND c.target_month = group_members.expense_end_month)
+                       WHERE c.group_id = group_members.group_id AND c.target_month >= group_members.expense_end_month)
+          AND NOT EXISTS (SELECT 1 FROM expenses e
+                           WHERE e.group_id = group_members.group_id AND e.target_month > group_members.expense_end_month
+                             AND NOT EXISTS (SELECT 1 FROM monthly_closings ec
+                                              WHERE ec.group_id = e.group_id AND ec.target_month = e.target_month)
+                             AND (e.payer_member_id = group_members.id
+                                  OR EXISTS (SELECT 1 FROM expense_allocations a
+                                              WHERE a.expense_id = e.id AND a.member_id = group_members.id)))
           AND NOT EXISTS (SELECT 1 FROM settlement_transfers t
                            WHERE t.group_id = group_members.group_id AND t.status = 'pending'
                              AND (t.from_member_id = group_members.id OR t.to_member_id = group_members.id))

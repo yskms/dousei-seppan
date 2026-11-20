@@ -13,11 +13,13 @@ import { loadClosedMonth, markLeftStatement } from './closedMonth.ts';
 import { insertRowsGuarded, readDataVersion, writeToGroup } from './groupWrite.ts';
 import { conflict, forbidden, json, notFound, unauthorized } from './http.ts';
 import {
+  confirmEndedLeaves,
   confirmLeaveStatements,
   deleteGroupStatements,
   dueLeaves,
   isLastMember,
   loadCategoryIds,
+  loadRuleMonthsAfter,
 } from './membership.ts';
 import { computeMonthFromState, evaluateClose, loadMonthState, type CloseBlock } from './monthState.ts';
 
@@ -133,6 +135,14 @@ export async function handleCloseMonth(
   // この月を脱退月に選んでいるメンバーの脱退は、月を締めたときに確定する（5章）。
   const members = [...state.members.values()];
   const due = dueLeaves(members, month);
+  if (due.some((member) => member.leaveRequestedMonth! < month)) {
+    // 脱退月が、この月より前なのに、確定していない。脱退月が、最初の締めで飛ばされた月のときに起きる（飛ばした月は、
+    // 締められないので、締めで確定する機会が無い）。このまま締めると、確定の前の割合で計算し、脱退した人に負担が付く。
+    // 先に、Cronと同じ処理で確定させる（この月の割合から、脱退した人が外れる）。確定のあとは、集計が変わるので、
+    // 締めずに409を返し、読み直してもらう。
+    await confirmEndedLeaves(db, groupId, now);
+    return conflict('conflict');
+  }
   if (isLastMember(members, due)) {
     // 最後の1人が抜けるときは、締めずに、グループのデータをすべて消す（5章「グループの削除」）。
     const deleted = await writeToGroup(db, groupId, version, (token) => deleteGroupStatements(db, token, groupId));
@@ -140,6 +150,8 @@ export async function handleCloseMonth(
     return json({ groupDeleted: true });
   }
   const categoryIds = due.length === 0 ? [] : await loadCategoryIds(db, groupId);
+  // 割合のリセットは、いま締める月より後の月だけ（その月より後に行がある月も、あわせて直す）。
+  const ruleMonths = due.length === 0 ? [] : await loadRuleMonthsAfter(db, groupId, month);
 
   const { result } = computeMonthFromState(state, month);
   const closingId = crypto.randomUUID();
@@ -268,8 +280,7 @@ export async function handleCloseMonth(
       ]),
     ),
     // 脱退の確定（送金は、上で作ったあと）。確定したメンバーで、送金が0件の人は、続く文で脱退済みになる。
-    // 割合のリセットは、いま締める月より後の月だけ。
-    ...confirmLeaveStatements(db, token, groupId, now, members, due, categoryIds, month),
+    ...confirmLeaveStatements(db, token, groupId, now, { members, due, categoryIds, closedThrough: month, ruleMonths }),
     // 脱退が確定していて、送金が0件のメンバーは、締めた時点で脱退済みにする（5章）。
     markLeftStatement(db, token, groupId, now, null),
   ]);

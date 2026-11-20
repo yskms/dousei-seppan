@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import worker from '../src/index.ts';
-import { DUE_LEAVES_SQL, MAX_GROUPS_PER_RUN, runScheduled } from '../src/cron.ts';
+import { DUE_LEAVES_SQL, QUERY_BUDGET_PER_RUN, runScheduled } from '../src/cron.ts';
 import {
   createFixtureFactory,
   equalShares,
@@ -16,7 +16,7 @@ import {
   type MemberOptions,
 } from './apiFixture.ts';
 import { openLocalDatabase, type LocalDatabase } from './localDatabase.ts';
-import { interferingEnv, NOW_DECEMBER } from './monthApi.ts';
+import { countingEnv, interferingEnv, NOW_DECEMBER } from './monthApi.ts';
 
 /** 2026-11-30 23:30（Asia/Tokyo）。11月はまだ終わっていない。 */
 const NOV_30_2330_JST = Date.UTC(2026, 10, 30, 14, 30, 0);
@@ -193,7 +193,7 @@ describe('定期処理: 月初の脱退の確定', () => {
   });
 });
 
-describe('定期処理: 1回の実行の上限', () => {
+describe('定期処理: 1回の実行のD1のクエリ数の予算', () => {
   let local: LocalDatabase;
   let db: D1Database;
   let env: Env;
@@ -209,18 +209,60 @@ describe('定期処理: 1回の実行の上限', () => {
     await local.dispose();
   });
 
-  it(`1回に確定するのは ${MAX_GROUPS_PER_RUN} グループまで。残りは次の回が引き受ける`, async () => {
+  const dueGroup = async () => {
+    const names = ['alice', 'bob', 'carol'] as const;
+    const g = await factory.createGroup(names, { alice: { leaveRequestedMonth: '2026-11' } });
+    await insertCategoryRule(db, g.groupId, g.categoryId, '2026-10', equalShares(names.map((name) => g.people[name].memberId)));
+    return g.groupId;
+  };
+
+  it(`1回の実行は、D1のクエリ数の予算（${QUERY_BUDGET_PER_RUN}。Freeの上限）に収まる。数えた数と、報告する数が一致する。残りは次の回が引き受ける`, async () => {
     const groupIds: string[] = [];
-    for (let i = 0; i < MAX_GROUPS_PER_RUN + 2; i++) {
-      const g = await factory.createGroup(['alice', 'bob'], { alice: { leaveRequestedMonth: '2026-11' } });
-      await insertCategoryRule(db, g.groupId, g.categoryId, '2026-10', equalShares([g.people.alice.memberId, g.people.bob.memberId]));
-      groupIds.push(g.groupId);
+    for (let i = 0; i < 8; i++) groupIds.push(await dueGroup());
+
+    const confirmed: string[] = [];
+    let runs = 0;
+    for (; runs < 8; runs++) {
+      const counting = countingEnv(env);
+      const summary = await runScheduled(counting.env, NOW_DECEMBER);
+      // 数えた数（prepare の呼び出し）と、報告する数が同じ（見積もりが、実際とずれていない）。
+      assert.equal(summary.queries, counting.counts.queries, `${runs}回目`);
+      assert.ok(counting.counts.queries <= QUERY_BUDGET_PER_RUN, `${runs}回目: ${counting.counts.queries} クエリ`);
+      confirmed.push(...summary.confirmedGroups);
+      if (summary.postponedGroups.length === 0) break;
+      assert.ok(summary.confirmedGroups.length >= 1 && summary.confirmedGroups.length < 8, '一部だけ確定して、残りは回す');
+      // 回したグループは、何も変わっていない。
+      for (const groupId of summary.postponedGroups) {
+        const row = await db
+          .prepare(`SELECT count(*) AS n FROM group_members WHERE group_id = ? AND status = 'active' AND leave_requested_month IS NOT NULL`)
+          .bind(groupId)
+          .first<{ n: number }>();
+        assert.equal(row!.n, 1);
+      }
     }
-    const first = await runScheduled(env, NOW_DECEMBER);
-    assert.equal(first.confirmedGroups.length, MAX_GROUPS_PER_RUN);
-    const second = await runScheduled(env, NOW_DECEMBER);
-    assert.equal(second.confirmedGroups.length, 2);
-    assert.deepEqual([...first.confirmedGroups, ...second.confirmedGroups].sort(), [...groupIds].sort());
+    assert.ok(runs >= 1, '8グループは、1回では終わらない');
+    assert.deepEqual([...confirmed].sort(), [...groupIds].sort());
     assert.equal((await runScheduled(env, NOW_DECEMBER)).confirmedGroups.length, 0);
+  });
+
+  it('1グループの確定は、15前後のクエリ（読み込み5〜6、書き込み約10）', async () => {
+    const one = await dueGroup();
+    const counting = countingEnv(env);
+    const summary = await runScheduled(counting.env, NOW_DECEMBER);
+    assert.deepEqual(summary.confirmedGroups, [one]);
+    // 探す1回 + 読み込み（版・タイムゾーン・メンバー・費目・締めた月・割合の行の月）6 + 書き込み（バージョン・状態・
+    // 割合のリセット4・招待・固定費2・脱退済み）。
+    assert.equal(counting.counts.queries, summary.queries);
+    assert.ok(counting.counts.queries >= 12 && counting.counts.queries <= 20, `クエリ数 ${counting.counts.queries}`);
+  });
+
+  it('予算が小さくても、1つ目のグループは必ず処理する（1つのグループの費用が予算より大きくても、進まなくならない）', async () => {
+    const ids = [await dueGroup(), await dueGroup()];
+    const first = await runScheduled(env, NOW_DECEMBER, 1);
+    assert.equal(first.confirmedGroups.length, 1);
+    assert.equal(first.postponedGroups.length, 1);
+    const second = await runScheduled(env, NOW_DECEMBER, 1);
+    assert.equal(second.confirmedGroups.length, 1);
+    assert.deepEqual([...first.confirmedGroups, ...second.confirmedGroups].sort(), [...ids].sort());
   });
 });

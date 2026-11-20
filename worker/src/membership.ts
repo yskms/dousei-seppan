@@ -4,10 +4,11 @@
 //
 // ここの `...Statements` は、どれも GROUP_WRITE_GUARD の条件つき（8章）。`writeToGroup` の build の中で呼ぶ。
 // 読み込み（`loadMembers`・`loadCategoryIds`）は、バージョンを読んだあとに呼ぶ（groupWrite.ts 冒頭の注意1）。
-import { participatesInMonth } from './access.ts';
-import { GROUP_WRITE_GUARD, insertRowsGuarded } from './groupWrite.ts';
+import { latestClosedMonth, participatesInMonth } from './access.ts';
+import { markLeftStatement } from './closedMonth.ts';
+import { GROUP_WRITE_GUARD, insertRowsGuarded, readDataVersion, writeToGroup } from './groupWrite.ts';
 import type { MemberInfo } from './monthState.ts';
-import { nextMonth } from './months.ts';
+import { monthIn, nextMonth } from './months.ts';
 import { allocateEqually, BASIS_POINTS_TOTAL } from './settlement.ts';
 
 /** アカウントを削除したメンバーの表示名（5章「アカウント削除」）。 */
@@ -115,6 +116,69 @@ export function resetSharesStatements(
 }
 
 /**
+ * 割合をリセットする最初の月。メンバーの増減が効く月（`month`）と、最初の未締めの月（`closedThrough` の翌月）の、
+ * 遅いほう。締めた月の割合は確定しているので、触れない。締めた月がリセットの月より後なら、その次の月から直す
+ * （締めた月の割合を引き継ぐ、最初の未締めの月に、増減したメンバーを反映するため）。
+ */
+export function firstResettableMonth(month: string, closedThrough: string | null): string {
+  if (closedThrough === null) return month;
+  const firstOpen = nextMonth(closedThrough);
+  return month >= firstOpen ? month : firstOpen;
+}
+
+/**
+ * 割合の行がある月のうち、`afterMonth` より後のもの（昇順・重複なし）。まだ締めていなければ（null）、すべて。
+ * `resetMonthsStatements` に渡す。
+ */
+export async function loadRuleMonthsAfter(db: D1Database, groupId: string, afterMonth: string | null): Promise<string[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT DISTINCT target_month FROM category_month_settings
+        WHERE group_id = ?1 AND target_month > ?2 ORDER BY target_month`,
+    )
+    .bind(groupId, afterMonth ?? '')
+    .all<{ target_month: string }>();
+  return results.map((row) => row.target_month);
+}
+
+/**
+ * リセットする月の一覧。`baseMonths`（メンバーの増減で割合を戻す月）と、そのどれかより後で、割合の行がある月
+ * （`ruleMonths`）。昇順・重複なし。
+ *
+ * 後の月の行は、その月以前で最も新しい行を引き継ぐ割合（3章）を、上書きしている。そこを直さないと、増えたメンバーが
+ * その月の割合に入らず（負担が0のまま続く）、減ったメンバーが残る。たとえば、アカウント削除は未締めの今月の
+ * うちに、翌月の行を書く。そのあと同じ月に参加した人は、翌月の行に入れない。
+ */
+export function monthsToReset(baseMonths: readonly string[], ruleMonths: readonly string[]): string[] {
+  const months = new Set(baseMonths);
+  for (const month of ruleMonths) {
+    if (baseMonths.some((base) => month > base)) months.add(month);
+  }
+  return [...months].sort();
+}
+
+/**
+ * `baseMonths` と、それより後に行がある月（`ruleMonths`）の全費目の割合を、それぞれの月に参加しているメンバーでの
+ * 均等にリセットする（`members` は、メンバーの増減を反映した状態）。後の月の行は、手で直された割合も上書きする。
+ * 締めた月には使わない（`baseMonths` と `ruleMonths` は、締めた月より後の月だけ）。
+ */
+export function resetMonthsStatements(
+  db: D1Database,
+  token: string,
+  groupId: string,
+  input: {
+    members: readonly MemberInfo[];
+    categoryIds: readonly string[];
+    baseMonths: readonly string[];
+    ruleMonths: readonly string[];
+  },
+): D1PreparedStatement[] {
+  return monthsToReset(input.baseMonths, input.ruleMonths).flatMap((month) =>
+    resetSharesStatements(db, token, groupId, month, input.categoryIds, participantIds(input.members, month)),
+  );
+}
+
+/**
  * 固定費の自動登録を止める（5章）。すでに止まっているもの（手動の停止など）は、理由を上書きしない。
  * - `payerMemberIds` が支払者の固定費: `payer_left`（付け替えられていないもの）。
  * - `memberChanged`: `category` 以外の負担方法の固定費は `member_changed`（個別の負担が、メンバーの増減で
@@ -204,24 +268,27 @@ export function isLastMember(members: readonly MemberInfo[], due: readonly Membe
  * 脱退済み（`left`）への遷移は含まない。呼び出し側が、`markLeftStatement`（closedMonth.ts）を、これの後ろに足す。
  *
  * `closedThrough`: この書き込みのあとで、締め済みになっている最後の月（まだ締めていなければ null）。割合のリセットは、
- * それより後の月だけ行う（締めた月の割合は確定している。月締めの中で呼ぶときは、いま締める月）。脱退月が、最初の締めで
- * 飛ばされた月のときなどに、脱退月の翌月が、締め済み・締める月になることがある。
+ * それより後の月だけ行う（締めた月の割合は確定している。月締めの中で呼ぶときは、いま締める月。`firstResettableMonth`）。
+ * 脱退月の翌月が、すでに締め済みのときは、最初の未締めの月から直す。
  */
 export function confirmLeaveStatements(
   db: D1Database,
   token: string,
   groupId: string,
   now: number,
-  members: readonly MemberInfo[],
-  due: readonly MemberInfo[],
-  categoryIds: readonly string[],
-  closedThrough: string | null,
+  context: {
+    members: readonly MemberInfo[];
+    due: readonly MemberInfo[];
+    categoryIds: readonly string[];
+    closedThrough: string | null;
+    /** `closedThrough` より後で、割合の行がある月（`loadRuleMonthsAfter`）。 */
+    ruleMonths: readonly string[];
+  },
 ): D1PreparedStatement[] {
+  const { members, due, categoryIds, closedThrough, ruleMonths } = context;
   if (due.length === 0) return [];
   const dueIds = due.map((member) => member.id);
-  const resetMonths = new Set(
-    due.map((member) => nextMonth(member.leaveRequestedMonth!)).filter((month) => closedThrough === null || month > closedThrough),
-  );
+  const baseMonths = due.map((member) => firstResettableMonth(nextMonth(member.leaveRequestedMonth!), closedThrough));
   return [
     db
       .prepare(
@@ -230,10 +297,8 @@ export function confirmLeaveStatements(
             AND id IN (${dueIds.map(() => '?').join(', ')}) AND EXISTS (${GROUP_WRITE_GUARD})`,
       )
       .bind(groupId, ...dueIds, groupId, token),
-    // 脱退月の翌月に参加しているのは、脱退を選んだメンバーを除く、そのとき参加している全員。
-    ...[...resetMonths].sort().flatMap((month) =>
-      resetSharesStatements(db, token, groupId, month, categoryIds, participantIds(members, month)),
-    ),
+    // 脱退月の翌月に参加しているのは、脱退を選んだメンバーを除く、そのとき参加している全員。それより後の月の行も直す。
+    ...resetMonthsStatements(db, token, groupId, { members, categoryIds, baseMonths, ruleMonths }),
     ...revokeInvitesStatement(db, token, groupId, now, dueIds),
     ...pauseRecurringStatements(db, token, groupId, now, { payerMemberIds: dueIds, memberChanged: true }),
   ];
@@ -274,4 +339,73 @@ export function deleteGroupRowStatement(db: D1Database, token: string, groupId: 
 /** グループのデータをすべて物理削除する文（5章「グループの削除」）。 */
 export function deleteGroupStatements(db: D1Database, token: string, groupId: string): D1PreparedStatement[] {
   return [...deleteGroupChildrenStatements(db, token, groupId), deleteGroupRowStatement(db, token, groupId)];
+}
+
+export interface EndedLeavesResult {
+  /**
+   * - `confirmed`: 脱退を確定させた。
+   * - `deleted`: 最後の1人の脱退を確定させて、グループを削除した。
+   * - `deferred`: 他の書き込みと競合したので、何も変えなかった（やり直さない）。
+   * - `nothing`: 確定させるものが無い（グループが無い場合も）。
+   */
+  result: 'confirmed' | 'deleted' | 'deferred' | 'nothing';
+  /** この処理が使ったD1のクエリ数（読み込みと、書き込みの文の数）。Cronの、1回の実行の予算の計算に使う。 */
+  queries: number;
+}
+
+/**
+ * 1つのグループの、脱退月が終わった脱退（グループのタイムゾーンの今月より前の月を脱退月に選んだままの、参加中のメンバー）
+ * を確定させる（5章）。月初のCron（cron.ts）と、月締め（脱退月が、最初の締めで飛ばされた月のとき。closings.ts）が使う。
+ * バージョンを先に読み、そのあとでデータを読む（groupWrite.ts 冒頭の注意1）。やり直さない（競合したら `deferred`）。
+ */
+export async function confirmEndedLeaves(db: D1Database, groupId: string, now: number): Promise<EndedLeavesResult> {
+  let queries = 0;
+  const counted = <T>(promise: Promise<T>): Promise<T> => {
+    queries += 1;
+    return promise;
+  };
+  const nothing = (): EndedLeavesResult => ({ result: 'nothing', queries });
+
+  const version = await counted(readDataVersion(db, groupId));
+  if (version === null) return nothing();
+  const group = await counted(
+    db.prepare('SELECT timezone FROM expense_groups WHERE id = ?').bind(groupId).first<{ timezone: string }>(),
+  );
+  if (group === null) return nothing();
+  const members = await counted(loadMembers(db, groupId));
+  // グループの今月より前の月を脱退月に選んだメンバー（月が終わったもの）。
+  const currentMonth = monthIn(group.timezone, now);
+  const due = dueLeaves(members, currentMonth).filter((member) => member.leaveRequestedMonth! < currentMonth);
+  if (due.length === 0) return nothing();
+
+  // 最後の1人の脱退は、確定と同時に、グループのデータをすべて消す（5章「グループの削除」）。
+  const lastMember = isLastMember(members, due);
+  const categoryIds = lastMember ? [] : await counted(loadCategoryIds(db, groupId));
+  const closedThrough = lastMember ? null : await counted(latestClosedMonth(db, groupId));
+  const ruleMonths = lastMember ? [] : await counted(loadRuleMonthsAfter(db, groupId, closedThrough));
+
+  let written = 0;
+  const result = await writeToGroup(db, groupId, version, (token) => {
+    const statements = lastMember
+      ? deleteGroupStatements(db, token, groupId)
+      : [
+          ...confirmLeaveStatements(db, token, groupId, now, { members, due, categoryIds, closedThrough, ruleMonths }),
+          // 脱退月がすでに締められていれば、送金が済んでいるメンバーは、そのまま脱退済みになる。
+          markLeftStatement(
+            db,
+            token,
+            groupId,
+            now,
+            due.map((member) => member.id),
+          ),
+        ];
+    written = statements.length;
+    return statements;
+  });
+  queries += 1 + written; // バージョンを上げる文と、書き込みの文
+  if (result.ok) return { result: lastMember ? 'deleted' : 'confirmed', queries };
+  // 'version': 利用者の操作と競合した。やり直さない（Cronは1時間ごとで冪等。月締めは409で読み直してもらう）。
+  if (result.reason === 'version') return { result: 'deferred', queries };
+  // 'unique': 確定の書き込みには、一意制約に触れる文が無い。出たら実装の誤りなので、握りつぶさない。
+  throw new Error('脱退の確定で、想定外の一意制約違反');
 }

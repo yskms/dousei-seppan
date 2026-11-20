@@ -20,7 +20,7 @@ import {
   type Person,
 } from './apiFixture.ts';
 import { openLocalDatabase, type LocalDatabase } from './localDatabase.ts';
-import { interferingEnv, monthApi } from './monthApi.ts';
+import { countingEnv, interferingEnv, monthApi } from './monthApi.ts';
 
 describe('アカウント削除のデータ処理', () => {
   let local: LocalDatabase;
@@ -259,15 +259,31 @@ describe('アカウント削除のデータ処理', () => {
       assert.deepEqual(await sharesOf(g.categoryId, '2026-11'), [[g.people.bob.memberId, 10000]]);
     });
 
-    it('脱退を選んだ月が、最初の締めで飛ばされた月でも、締めた月の割合はリセットしない', async () => {
+    it('脱退を選んだ月が、最初の締めで飛ばされた月でも、締めた月の割合には触れず、最初の未締めの月から直す', async () => {
       const g = await setup(['alice', 'bob'], { alice: { leaveRequestedMonth: '2026-10' } });
       const ids = [g.people.alice.memberId, g.people.bob.memberId];
       await insertCategoryRule(db, g.groupId, g.categoryId, '2026-11', equalShares(ids));
       await insertClosing(db, g.groupId, '2026-11', g.people.bob.memberId);
       assert.equal((await deleteAccount(db, g.people.alice.userId, NOW)).status, 'deleted');
-      // 最後の月は脱退月（2026-10）。リセットの対象は翌月（2026-11）だが、すでに締められているので、触れない。
+      // 最後の月は脱退月（2026-10）。リセットの対象は翌月（2026-11）だが、すでに締められているので触れず、
+      // 締めた月の割合を引き継ぐ、最初の未締めの月（2026-12）から、bob だけに直す。
       assert.equal((await memberRow(g.people.alice.memberId))!.expense_end_month, '2026-10');
       assert.equal((await sharesOf(g.categoryId, '2026-11')).length, 2);
+      assert.deepEqual(await sharesOf(g.categoryId, '2026-12'), [[g.people.bob.memberId, 10000]]);
+    });
+
+    it('翌月より後に割合の行がある月（別のメンバーの削除が書いたものなど）も、あわせて直す', async () => {
+      const g = await setup(['alice', 'bob', 'carol']);
+      const { alice, bob, carol } = g.people;
+      await deleteAccount(db, bob.userId, NOW); // 2026-12 の行が、alice・carol の2人で書かれる
+      assert.equal((await sharesOf(g.categoryId, '2026-12')).length, 2);
+      // さらに先の月にも、行がある（3人のまま）。
+      await insertCategoryRule(db, g.groupId, g.categoryId, '2027-01', equalShares([alice.memberId, bob.memberId, carol.memberId]));
+
+      assert.equal((await deleteAccount(db, alice.userId, NOW)).status, 'deleted');
+      assert.deepEqual(await sharesOf(g.categoryId, '2026-12'), [[carol.memberId, 10000]]);
+      assert.deepEqual(await sharesOf(g.categoryId, '2027-01'), [[carol.memberId, 10000]]);
+      assert.equal((await sharesOf(g.categoryId, '2026-11')).length, 0, '今月（2026-11）には行が無く、2026-10 のものを引き継ぐ。書き込まない');
     });
 
     it('脱退済み・削除済みのメンバーしか残らないグループは、自分が脱退済みでも消す（誰も見られないグループを残さない）', async () => {
@@ -352,5 +368,55 @@ describe('アカウント削除のデータ処理', () => {
       assert.equal(await count('SELECT count(*) AS n FROM group_members WHERE user_id = ?', alice.userId), 0);
       assert.equal(await userExists(alice.userId), false);
     });
+  });
+});
+
+describe('アカウント削除のD1のクエリ数（Freeは1回の呼び出しにつき50まで）', () => {
+  let local: LocalDatabase;
+  let db: D1Database;
+  let env: Env;
+  let factory: ReturnType<typeof createFixtureFactory>;
+
+  before(async () => {
+    local = await openLocalDatabase();
+    db = local.db;
+    env = local.env;
+    factory = createFixtureFactory(db);
+  });
+  after(async () => {
+    await local.dispose();
+  });
+
+  /** alice が、k個のグループ（それぞれ、ほかに2人）に参加中。 */
+  const aliceInGroups = async (k: number) => {
+    const alice = await factory.addUser('alice');
+    for (let i = 0; i < k; i++) {
+      const g = await factory.createGroup(['zed', 'yan']);
+      await insertCategoryRule(db, g.groupId, g.categoryId, '2026-10', equalShares([g.people.zed.memberId, g.people.yan.memberId]));
+      await factory.addMember(g.groupId, 'alice', alice.userId, {});
+    }
+    return alice;
+  };
+
+  it('読み込みは、グループの数によらず、固定の6回。書き込みの文が、グループごとに増える', async () => {
+    const perGroup: number[] = [];
+    for (const k of [1, 2, 3, 5]) {
+      const alice = await aliceInGroups(k);
+      const counting = countingEnv(env);
+      assert.equal((await deleteAccount(counting.env.DB, alice.userId, NOW)).status, 'deleted');
+      const [writes] = counting.counts.batchSizes;
+      // 読み込み: 所属・バージョン・メンバー・費目・最後に締めた月・割合の行の月。
+      assert.equal(counting.counts.queries - writes!, 6, `${k}グループ`);
+      perGroup.push(writes!);
+    }
+    // 書き込み: バージョンの更新1 + ユーザーの削除1 + グループごとの匿名化（メンバー・スナップショット・
+    // 割合のリセット4・招待・固定費2の、約9文）。
+    assert.deepEqual(
+      perGroup.map((n, index) => (n - 2) / [1, 2, 3, 5][index]!),
+      [9, 9, 9, 9],
+    );
+    // Freeの上限（50）に収まるのは、グループ数が4つまで（6 + 2 + 9×4 = 44。5つで53）。Paid（1000）では、100グループ以上。
+    assert.ok(6 + perGroup[2]! <= 50);
+    assert.ok(6 + perGroup[3]! > 50);
   });
 });

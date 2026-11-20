@@ -4,7 +4,7 @@
 // ローカルD1（miniflare）での検査なので、確かめるのはロジック。
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
-import { dueLeaves, isLastMember } from '../src/membership.ts';
+import { dueLeaves, firstResettableMonth, isLastMember, monthsToReset } from '../src/membership.ts';
 import type { MemberInfo } from '../src/monthState.ts';
 import {
   createFixtureFactory,
@@ -18,7 +18,8 @@ import {
   type Person,
 } from './apiFixture.ts';
 import { openLocalDatabase, type LocalDatabase } from './localDatabase.ts';
-import { monthApi } from './monthApi.ts';
+import { membershipApi } from './membershipApi.ts';
+import { monthApi, NOW_DECEMBER } from './monthApi.ts';
 
 const member = (id: string, overrides: Partial<MemberInfo> = {}): MemberInfo => ({
   id,
@@ -57,6 +58,23 @@ describe('脱退の確定の対象と、最後の1人の判定（純粋な関数
     const second = member('b', { leaveRequestedMonth: '2026-10' });
     assert.equal(isLastMember([alone, second], [alone, second]), false, '2人が同時に抜けるときは、精算が残るので消さない');
     assert.equal(isLastMember([alone], []), false, '抜ける人がいなければ false');
+  });
+});
+
+describe('割合をリセットする月（純粋な関数）', () => {
+  it('firstResettableMonth: 増減が効く月と、最初の未締めの月の、遅いほう', () => {
+    assert.equal(firstResettableMonth('2026-11', null), '2026-11');
+    assert.equal(firstResettableMonth('2026-11', '2026-10'), '2026-11');
+    assert.equal(firstResettableMonth('2026-11', '2026-11'), '2026-12', '締めた月は、次の月から');
+    assert.equal(firstResettableMonth('2026-11', '2027-02'), '2027-03', '締めた月が、ずっと先なら、その次の月から');
+    assert.equal(firstResettableMonth('2026-12', '2026-11'), '2026-12');
+  });
+
+  it('monthsToReset: 基準の月と、そのどれかより後に行がある月。昇順・重複なし', () => {
+    assert.deepEqual(monthsToReset(['2026-12'], []), ['2026-12']);
+    assert.deepEqual(monthsToReset(['2026-12'], ['2026-12', '2027-01', '2027-03']), ['2026-12', '2027-01', '2027-03']);
+    assert.deepEqual(monthsToReset(['2027-01', '2026-12'], ['2026-11', '2027-02']), ['2026-12', '2027-01', '2027-02'], '基準より前の行は直さない');
+    assert.deepEqual(monthsToReset([], ['2026-12']), [], '基準が無ければ、何もしない');
   });
 });
 
@@ -247,28 +265,118 @@ describe('月締めでの脱退の確定', () => {
     assert.equal((await sharesOf(g.categoryId, '2026-11')).length, 0);
   });
 
-  it('脱退月が「飛ばした月」のとき（最初の締めが、それより後の月）も、締める月・締めた月の割合は、リセットしない', async () => {
-    // 作成月（2026-10）を脱退月に選んだ alice が、Cronの確定の前に、最初の支出がある月（2026-11）の締めを迎える。
-    // 確定の翌月（2026-11）は、いま締める月なので、リセットの対象にしない（締める月の割合は、引き継ぎで書く）。
-    const g = await setup(['alice', 'bob'], { alice: { leaveRequestedMonth: '2026-10' } });
-    await insertExpenseRow(db, {
-      groupId: g.groupId,
-      categoryId: g.categoryId,
-      payerMemberId: g.people.bob.memberId,
-      amountMinor: 6000,
-      targetMonth: '2026-11',
+  describe('脱退月が「飛ばした月」のとき（最初の締めが、脱退月より後の月）', () => {
+    // 作成月（2026-10）を脱退月に選んだ alice が、確定の前に、最初の支出がある月（2026-11）の締めを迎える。
+    // 2026-10 は、支出が無く、最初の締めで飛ばされるので、あとから締められない。
+    const skippedMonthGroup = async () => {
+      const g = await setup(['alice', 'bob'], { alice: { leaveRequestedMonth: '2026-10' } });
+      await insertExpenseRow(db, {
+        groupId: g.groupId,
+        categoryId: g.categoryId,
+        payerMemberId: g.people.bob.memberId,
+        amountMinor: 6000,
+        targetMonth: '2026-11',
+      });
+      return g;
+    };
+
+    it('確定の前に締めようとすると、先に確定させて409。読み直して締めると、alice は2026-11の負担に入らない', async () => {
+      const g = await skippedMonthGroup();
+      const first = await api.close(g.people.bob, g.groupId, '2026-11');
+      assert.deepEqual([first.status, first.body], [409, { error: 'conflict' }]);
+      // 締めずに、確定だけが書かれた。2026-11 の割合から、alice が外れている。
+      assert.equal((await memberRow(g.people.alice.memberId))!.status, 'leaving');
+      assert.deepEqual(await sharesOf(g.categoryId, '2026-11'), [[g.people.bob.memberId, 10000]]);
+      assert.equal(
+        (await db.prepare('SELECT count(*) AS n FROM monthly_closings WHERE group_id = ?').bind(g.groupId).first<{ n: number }>())!.n,
+        0,
+      );
+
+      const second = await api.close(g.people.bob, g.groupId, '2026-11');
+      assert.equal(second.status, 201, JSON.stringify(second.body));
+      const alice = (second.body.members as { memberId: string; burdenMinor: number }[]).find((m) => m.memberId === g.people.alice.memberId);
+      assert.equal(alice?.burdenMinor ?? 0, 0, '脱退月（2026-10）の翌月の負担は、alice に付かない');
+      assert.deepEqual(second.body.transfers, [], '全額を bob が払って負担するので、送金は無い');
     });
-    const closed = await api.close(g.people.bob, g.groupId, '2026-11');
-    assert.equal(closed.status, 201, JSON.stringify(closed.body));
-    assert.deepEqual(await memberRow(g.people.alice.memberId), {
-      status: 'leaving',
-      expense_end_month: '2026-10',
-      leave_requested_month: '2026-10',
-      left_at: null,
+
+    it('脱退月（2026-10）は、締められない月。それより後の月を締めたとき、関わる送金が無ければ、脱退済みになる', async () => {
+      const g = await skippedMonthGroup();
+      await api.close(g.people.bob, g.groupId, '2026-11'); // 先に確定
+      const closed = await api.close(g.people.bob, g.groupId, '2026-11');
+      assert.equal(closed.status, 201);
+      // alice に関わる送金は無いので、その締めの中で脱退済みになる（脱退月の締めを待たない）。
+      const row = await memberRow(g.people.alice.memberId);
+      assert.deepEqual([row!.status, row!.expense_end_month], ['left', '2026-10']);
     });
-    // 2026-11 の割合は、引き継ぎで書かれた2人の均等のまま（alice は脱退月 2026-10 を過ぎているが、締めた月は確定している）。
-    assert.equal((await sharesOf(g.categoryId, '2026-11')).length, 2);
-    assert.equal((await sharesOf(g.categoryId, '2026-12')).length, 0);
+  });
+
+  describe('脱退を選ぶ前に登録された、翌月の支出に関わっているメンバー', () => {
+    // 2026-10・2026-11 を早めに締めたあと、翌月（2026-12）の支出に bob を支払者にして登録する。そのあとで bob が脱退を選ぶと、
+    // 脱退月（2026-11）はすでに締められているので、その場で確定する。2026-12 を締めると、bob が関わる送金ができる。
+    it('その支出がある間は、脱退済みにならず、脱退が確定した（leaving）まま。月を締めて、送金を精算すると、脱退済みになる', async () => {
+      const g = await setup(['alice', 'bob']);
+      const { alice, bob } = g.people;
+      assert.equal((await api.close(alice, g.groupId, '2026-10')).status, 201);
+      assert.equal((await api.close(alice, g.groupId, '2026-11')).status, 201);
+      await insertExpenseRow(db, {
+        groupId: g.groupId,
+        categoryId: g.categoryId,
+        payerMemberId: bob.memberId,
+        amountMinor: 6000,
+        targetMonth: '2026-12',
+      });
+      const left = await membershipApi(env).requestLeave(bob, g.groupId);
+      assert.equal(left.body.confirmed, true);
+      assert.equal((await memberRow(bob.memberId))!.status, 'leaving', '2026-12 の支出に関わっているので、脱退済みにしない');
+
+      // 12月を締めると、bob が関わる送金ができる。bob は見られて、精算できる。
+      const december = await api.close(alice, g.groupId, '2026-12', { now: NOW_DECEMBER });
+      assert.equal(december.status, 201, JSON.stringify(december.body));
+      assert.equal(december.body.transfers.length, 1);
+      assert.equal((await memberRow(bob.memberId))!.status, 'leaving', '送金が未処理');
+      assert.equal((await api.settle(bob, december.body.transfers[0].id, { now: NOW_DECEMBER })).status, 200);
+      assert.equal((await memberRow(bob.memberId))!.status, 'left');
+    });
+
+    it('その支出が、別の月の支出や、本人が関わらない支出なら、これまでどおり、その場で脱退済みになる', async () => {
+      const g = await setup(['alice', 'bob']);
+      const { alice, bob } = g.people;
+      assert.equal((await api.close(alice, g.groupId, '2026-10')).status, 201);
+      assert.equal((await api.close(alice, g.groupId, '2026-11')).status, 201);
+      await insertExpenseRow(db, {
+        groupId: g.groupId,
+        categoryId: g.categoryId,
+        payerMemberId: alice.memberId,
+        amountMinor: 6000,
+        targetMonth: '2026-12',
+        split: { method: 'single', allocations: [[alice.memberId, 6000]] },
+      });
+      assert.equal((await membershipApi(env).requestLeave(bob, g.groupId)).body.confirmed, true);
+      assert.equal((await memberRow(bob.memberId))!.status, 'left');
+    });
+
+    it('本人が負担の対象（個別設定の支出の割り当て）になっている場合も、同じ', async () => {
+      const g = await setup(['alice', 'bob']);
+      const { alice, bob } = g.people;
+      assert.equal((await api.close(alice, g.groupId, '2026-10')).status, 201);
+      assert.equal((await api.close(alice, g.groupId, '2026-11')).status, 201);
+      await insertExpenseRow(db, {
+        groupId: g.groupId,
+        categoryId: g.categoryId,
+        payerMemberId: alice.memberId,
+        amountMinor: 6000,
+        targetMonth: '2026-12',
+        split: {
+          method: 'equal',
+          allocations: [
+            [alice.memberId, 3000],
+            [bob.memberId, 3000],
+          ],
+        },
+      });
+      assert.equal((await membershipApi(env).requestLeave(bob, g.groupId)).body.confirmed, true);
+      assert.equal((await memberRow(bob.memberId))!.status, 'leaving');
+    });
   });
 
   it('2人が同時に脱退を確定しても、グループは消えない（お互いの精算が残る）。確定した翌月に参加する人はいないので、割合は書かない', async () => {

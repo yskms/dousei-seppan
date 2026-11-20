@@ -17,6 +17,7 @@ import {
   isLastMember,
   loadCategoryIds,
   loadMembers,
+  loadRuleMonthsAfter,
 } from './membership.ts';
 import { monthIn } from './months.ts';
 
@@ -68,9 +69,10 @@ export async function handleRequestLeave(request: Request, env: Env, now: number
   }
   const categoryIds = await loadCategoryIds(db, groupId);
   const closedThrough = await latestClosedMonth(db, groupId);
+  const ruleMonths = await loadRuleMonthsAfter(db, groupId, closedThrough);
   const written = await writeToGroup(db, groupId, version, (token) => [
     requested(token),
-    ...confirmLeaveStatements(db, token, groupId, now, members, due, categoryIds, closedThrough),
+    ...confirmLeaveStatements(db, token, groupId, now, { members, due, categoryIds, closedThrough, ruleMonths }),
     // 関わる送金が無ければ、そのまま脱退済みになる。
     markLeftStatement(db, token, groupId, now, [access.member.id]),
   ]);

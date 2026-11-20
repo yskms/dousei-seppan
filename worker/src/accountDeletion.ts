@@ -13,19 +13,17 @@
 // 書き込みの前に、先にバージョンを読み、そのあとでデータを読む（groupWrite.ts 冒頭の注意1）。
 // 「どのグループのメンバーか」を、バージョンより前に読むので、読んだあとに新しいグループへ参加されると、そのグループが
 // 抜ける。それを検出するため、書き込みの条件に「いまのメンバー行が、読んだグループの中だけ」を足している。
-import { latestClosedMonth } from './access.ts';
 import { GROUP_WRITE_GUARD, writeToGroups } from './groupWrite.ts';
 import {
   DELETED_USER_NAME,
   deleteGroupChildrenStatements,
   deleteGroupRowStatement,
-  loadCategoryIds,
-  loadMembers,
-  participantIds,
   pauseRecurringStatements,
-  resetSharesStatements,
+  firstResettableMonth,
+  resetMonthsStatements,
   revokeInvitesStatement,
 } from './membership.ts';
+import type { MemberInfo } from './monthState.ts';
 import { monthIn, nextMonth } from './months.ts';
 
 export type DeleteAccountResult =
@@ -38,10 +36,12 @@ interface GroupPlan {
   version: number;
   timezone: string;
   memberId: string;
-  members: Awaited<ReturnType<typeof loadMembers>>;
+  members: MemberInfo[];
   categoryIds: string[];
   /** 最後に締めた月。まだ締めていなければ null。 */
   closedThrough: string | null;
+  /** `closedThrough` より後で、割合の行がある月。 */
+  ruleMonths: string[];
   /** 残るメンバーがいないので、グループごと消す。 */
   deletesGroup: boolean;
 }
@@ -68,7 +68,8 @@ async function attempt(db: D1Database, userId: string, now: number): Promise<Del
   const groupIds = memberships.map((row) => row.group_id);
   const groupIdsJson = JSON.stringify(groupIds);
 
-  // バージョンが先。そのあとで、メンバー・費目のデータを読む。
+  // バージョンが先。そのあとで、メンバー・費目などのデータを読む。読み込みは、グループの数によらず、固定の回数
+  // （`json_each` でグループをまとめて引く）。グループごとに引くと、所属したグループの数だけ、D1のクエリ数が増える。
   const { results: versionRows } = await db
     .prepare('SELECT id, data_version, timezone FROM expense_groups WHERE id IN (SELECT value FROM json_each(?))')
     .bind(groupIdsJson)
@@ -76,23 +77,74 @@ async function attempt(db: D1Database, userId: string, now: number): Promise<Del
   if (versionRows.length !== groupIds.length) return null; // 読んでいる間に、グループが消えた。
   const versions = new Map(versionRows.map((row) => [row.id, row]));
 
-  const plans: GroupPlan[] = [];
-  for (const membership of memberships) {
+  const { results: memberRows } = await db
+    .prepare(
+      `SELECT group_id, id, display_name, status, history_from_month, expense_end_month, leave_requested_month
+         FROM group_members WHERE group_id IN (SELECT value FROM json_each(?))`,
+    )
+    .bind(groupIdsJson)
+    .all<{
+      group_id: string;
+      id: string;
+      display_name: string;
+      status: MemberInfo['status'];
+      history_from_month: string;
+      expense_end_month: string | null;
+      leave_requested_month: string | null;
+    }>();
+  const { results: categoryRows } = await db
+    .prepare('SELECT group_id, id FROM categories WHERE group_id IN (SELECT value FROM json_each(?)) ORDER BY id')
+    .bind(groupIdsJson)
+    .all<{ group_id: string; id: string }>();
+  const { results: closedRows } = await db
+    .prepare(
+      `SELECT group_id, max(target_month) AS month FROM monthly_closings
+        WHERE group_id IN (SELECT value FROM json_each(?)) GROUP BY group_id`,
+    )
+    .bind(groupIdsJson)
+    .all<{ group_id: string; month: string }>();
+  const closedThrough = new Map(closedRows.map((row) => [row.group_id, row.month]));
+  // 割合の行がある月のうち、どのグループの締めた月よりも後のもの（グループごとの絞り込みは、下で行う）。
+  const lowestClosed = groupIds.some((id) => !closedThrough.has(id))
+    ? ''
+    : [...closedThrough.values()].reduce((lowest, month) => (month < lowest ? month : lowest));
+  const { results: ruleMonthRows } = await db
+    .prepare(
+      `SELECT DISTINCT group_id, target_month FROM category_month_settings
+        WHERE group_id IN (SELECT value FROM json_each(?1)) AND target_month > ?2 ORDER BY target_month`,
+    )
+    .bind(groupIdsJson, lowestClosed)
+    .all<{ group_id: string; target_month: string }>();
+
+  const plans: GroupPlan[] = memberships.map((membership) => {
     const group = versions.get(membership.group_id)!;
-    const members = await loadMembers(db, membership.group_id);
-    plans.push({
+    const members: MemberInfo[] = memberRows
+      .filter((row) => row.group_id === membership.group_id)
+      .map((row) => ({
+        id: row.id,
+        displayName: row.display_name,
+        status: row.status,
+        historyFromMonth: row.history_from_month,
+        expenseEndMonth: row.expense_end_month,
+        leaveRequestedMonth: row.leave_requested_month,
+      }));
+    const closed = closedThrough.get(membership.group_id) ?? null;
+    return {
       groupId: membership.group_id,
       version: group.data_version,
       timezone: group.timezone,
       memberId: membership.member_id,
       members,
-      categoryIds: await loadCategoryIds(db, membership.group_id),
-      closedThrough: await latestClosedMonth(db, membership.group_id),
+      categoryIds: categoryRows.filter((row) => row.group_id === membership.group_id).map((row) => row.id),
+      closedThrough: closed,
+      ruleMonths: ruleMonthRows
+        .filter((row) => row.group_id === membership.group_id && (closed === null || row.target_month > closed))
+        .map((row) => row.target_month),
       deletesGroup: members.every(
         (member) => member.id === membership.member_id || (member.status !== 'active' && member.status !== 'leaving'),
       ),
-    });
-  }
+    };
+  });
 
   const written = await writeToGroups(
     db,
@@ -168,17 +220,21 @@ function anonymizeStatements(
   // 脱退が確定した・脱退済みの人は、確定のときに、割合のリセット・招待の取り消し・固定費の停止を済ませている。
   if (me.status === 'active') {
     const resetMonth = nextMonth(endMonth!);
-    // 締めた月の割合は確定している。脱退を選んだ月が、最初の締めで飛ばされた月のときなどは、リセットしない。
-    const resettable = plan.closedThrough === null || resetMonth > plan.closedThrough;
+    // 締めた月の割合は確定している。脱退を選んだ月が、最初の締めで飛ばされた月のときなどは、最初の未締めの月から直す。
+    const baseMonths = [firstResettableMonth(resetMonth, plan.closedThrough)];
     const after = plan.members.map((member) =>
       member.id === plan.memberId
         ? { ...member, status: 'deleted' as const, displayName: DELETED_USER_NAME, expenseEndMonth: endMonth }
         : member,
     );
     statements.push(
-      ...(resettable
-        ? resetSharesStatements(db, token, plan.groupId, resetMonth, plan.categoryIds, participantIds(after, resetMonth))
-        : []),
+      // その翌月より後に行がある月（別のグループの削除などで書かれたもの）も、あわせて直す。
+      ...resetMonthsStatements(db, token, plan.groupId, {
+        members: after,
+        categoryIds: plan.categoryIds,
+        baseMonths,
+        ruleMonths: plan.ruleMonths,
+      }),
       ...revokeInvitesStatement(db, token, plan.groupId, now, [plan.memberId]),
       ...pauseRecurringStatements(db, token, plan.groupId, now, { payerMemberIds: [plan.memberId], memberChanged: true }),
     );

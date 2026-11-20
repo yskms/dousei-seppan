@@ -5,6 +5,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { after, before, describe, it } from 'node:test';
+import { deleteAccount } from '../src/accountDeletion.ts';
 import worker from '../src/index.ts';
 import { INVITE_TTL_MS, MAX_UNUSED_INVITES_PER_MEMBER } from '../src/invites.ts';
 import {
@@ -402,6 +403,26 @@ describe('招待・参加のAPI', () => {
       }
       // 参加月より前の月の割合は、そのまま（2人の均等）。
       assert.equal((await sharesOf(g.categoryId, '2026-10')).length, 2);
+    });
+
+    it('参加月より後の月に、割合の行が残っていれば、それも直す（アカウント削除が、未締めの翌月に書いた行に、参加した人が入る）', async () => {
+      const g = await setup();
+      const { alice, bob } = g.people;
+      await deleteAccount(db, alice.userId, NOW); // 2026-12 の行が、残る bob だけで書かれる
+      assert.deepEqual(await sharesOf(g.categoryId, '2026-12'), [[bob.memberId, 10000]]);
+      const invite = await insertInviteRow(db, { groupId: g.groupId, invitedByMemberId: bob.memberId });
+
+      const result = await api.join(await outsider('visitor'), invite.token);
+      assert.equal(result.status, 201);
+      const newcomer = result.body.memberId as string;
+      // 参加月（2026-11）は、削除した alice（削除した月まで集計に入る）・bob・新しいメンバーの3人。
+      assert.equal((await sharesOf(g.categoryId, '2026-11')).length, 3);
+      // 翌月（2026-12）は、alice が抜けたあとの、bob と新しいメンバーの2人の均等。
+      assert.deepEqual(
+        (await sharesOf(g.categoryId, '2026-12')).map((row) => row[0]).sort(),
+        [bob.memberId, newcomer].sort(),
+      );
+      assert.deepEqual((await sharesOf(g.categoryId, '2026-12')).map((row) => row[1]), [5000, 5000]);
     });
 
     it('category 以外の固定費は止める（member_changed）。category の固定費・止まっている固定費は変えない', async () => {

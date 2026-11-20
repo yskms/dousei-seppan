@@ -10,7 +10,13 @@
 //   `invite_unavailable`（どの状態かを教えない）。
 //
 // 書き込みの前に、先に `readDataVersion` でバージョンを読み、そのあとでデータを読む（groupWrite.ts 冒頭の注意1）。
-import { authenticateRequest, canIssueInvites, latestClosedMonth, loadGroupAccess } from './access.ts';
+import {
+  authenticateRequest,
+  canIssueInvites,
+  isLeaveEffectiveFor,
+  latestClosedMonth,
+  loadGroupAccess,
+} from './access.ts';
 import {
   GROUP_WRITE_GUARD,
   insertRowsGuarded,
@@ -21,14 +27,15 @@ import {
 import { conflict, forbidden, invalidRequest, json, noContent, notFound, readJsonObject, unauthorized } from './http.ts';
 import { parseJoin } from './memberInput.ts';
 import {
+  firstResettableMonth,
   loadCategoryIds,
   loadMembers,
-  participantIds,
+  loadRuleMonthsAfter,
   pauseRecurringStatements,
   pickMemberColor,
-  resetSharesStatements,
+  resetMonthsStatements,
 } from './membership.ts';
-import { maxMonth, monthIn, nextMonth } from './months.ts';
+import { monthIn } from './months.ts';
 import { hashToken, toBase64Url } from './session.ts';
 
 /** 招待の有効期間（発行から3日）。 */
@@ -211,15 +218,17 @@ async function findInviteByHash(db: D1Database, tokenHash: string): Promise<Invi
 }
 
 /**
- * 参加に使える招待か。未使用・未取り消し・期限内で、発行した人が、まだ招待を発行できる状態（参加中で、脱退を選んだ月が
- * 終わっていない）であること。発行した人の脱退が確定すれば、その人の招待は取り消されるが、Cronが確定させるまでの間も
- * 使えないようにする（access.ts の `isLeaveEffective` と同じ扱い）。
+ * 参加に使える招待か。未使用・未取り消し・期限内で、発行した人が、まだ招待を発行できる状態（脱退が確定したものとして
+ * 扱わない）であること。発行した人の脱退が確定すれば、その人の招待は取り消されるが、Cronが確定させるまでの間も
+ * 使えないようにする（`isLeaveEffectiveFor`。access.ts の `isLeaveEffective` と同じ判定）。
  */
 function isUsable(invite: InviteRow, now: number): boolean {
   if (invite.consumed_at !== null || invite.revoked_at !== null || invite.expires_at <= now) return false;
-  if (invite.inviter_status !== 'active') return false;
-  const leaveMonth = invite.inviter_leave_requested_month;
-  return leaveMonth === null || monthIn(invite.timezone, now) <= leaveMonth;
+  return !isLeaveEffectiveFor(
+    { status: invite.inviter_status, leaveRequestedMonth: invite.inviter_leave_requested_month },
+    invite.timezone,
+    now,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -298,13 +307,14 @@ export async function handleJoin(request: Request, env: Env, now: number, token:
   // 参加月は、グループのタイムゾーンの今月。履歴を見られるのは、参加月から（5章）。
   const joinMonth = monthIn(invite.timezone, now);
   // 割合をリセットする月。参加月がすでに締められていれば（早めに締めた後）、締めた月は触れないので、翌月。
-  const resetMonth = latestClosed === null ? joinMonth : maxMonth(joinMonth, nextMonth(latestClosed));
+  const resetMonth = firstResettableMonth(joinMonth, latestClosed);
   // 一度脱退した人（`left`）は、元のメンバー行に戻す（5章）。
   const memberId = mine?.id ?? crypto.randomUUID();
   const color = pickMemberColor(
     memberRows.filter((row) => row.status === 'active' || row.status === 'leaving').map((row) => row.color),
     mine?.color ?? null,
   );
+  const ruleMonths = await loadRuleMonthsAfter(db, groupId, resetMonth);
   const joined = {
     id: memberId,
     displayName,
@@ -344,8 +354,14 @@ export async function handleJoin(request: Request, env: Env, now: number, token:
             AND EXISTS (${GROUP_WRITE_GUARD})`,
       )
       .bind(now, memberId, invite.id, groupId, now, groupId, writeToken),
-    // 参加月の全費目の割合を、新しいメンバーを含めた均等にリセットし、上限額の設定を外す（5章）。
-    ...resetSharesStatements(db, writeToken, groupId, resetMonth, categoryIds, participantIds(membersAfter, resetMonth)),
+    // 参加月の全費目の割合を、新しいメンバーを含めた均等にリセットし、上限額の設定を外す（5章）。それより後の月に
+    // 行があれば（アカウント削除が、未締めの翌月に書いたものなど）、それも直す。
+    ...resetMonthsStatements(db, writeToken, groupId, {
+      members: membersAfter,
+      categoryIds,
+      baseMonths: [resetMonth],
+      ruleMonths,
+    }),
     // `category` 以外の固定費は、自動登録を止める（5章）。
     ...pauseRecurringStatements(db, writeToken, groupId, now, { payerMemberIds: [], memberChanged: true }),
   ]);
