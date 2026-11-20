@@ -5,6 +5,15 @@ import { isId } from './expenseInput.ts';
 import { handleCreateExpense, handleDeleteExpense, handleListExpenses, handleUpdateExpense } from './expenses.ts';
 import { methodNotAllowed, notFound } from './http.ts';
 import { httpsRequiredResponse, isInsecureRequest } from './https.ts';
+import {
+  handleCreateInvite,
+  handleGetInvite,
+  handleJoin,
+  handleListInvites,
+  handleRevokeInvite,
+  isInviteToken,
+} from './invites.ts';
+import { handleCancelLeave, handleRequestLeave } from './leave.ts';
 import { isMonth } from './months.ts';
 import { handleProcessTransfer } from './transfers.ts';
 
@@ -12,6 +21,11 @@ const GROUP_EXPENSES_PATH = /^\/groups\/([^/]+)\/expenses$/;
 const EXPENSE_PATH = /^\/expenses\/([^/]+)$/;
 const GROUP_MONTH_PATH = /^\/groups\/([^/]+)\/months\/([^/]+)\/(summary|close|closing)$/;
 const TRANSFER_PATH = /^\/transfers\/([^/]+)\/(settle|carry)$/;
+const GROUP_INVITES_PATH = /^\/groups\/([^/]+)\/invites$/;
+const GROUP_LEAVE_PATH = /^\/groups\/([^/]+)\/leave$/;
+// `/invites/:x` は、GET が招待トークン、DELETE が招待のID。
+const INVITE_PATH = /^\/invites\/([^/]+)$/;
+const INVITE_JOIN_PATH = /^\/invites\/([^/]+)\/join$/;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -63,6 +77,40 @@ export default {
       if (!isId(transferId)) return notFound();
       if (request.method !== 'POST') return methodNotAllowed('POST');
       return handleProcessTransfer(request, env, now, transferId, transfer[2] === 'settle' ? 'settle' : 'carry');
+    }
+
+    const groupInvites = GROUP_INVITES_PATH.exec(pathname);
+    if (groupInvites !== null) {
+      const groupId = groupInvites[1]!;
+      if (!isId(groupId)) return notFound();
+      if (request.method === 'GET') return handleListInvites(request, env, now, groupId);
+      if (request.method === 'POST') return handleCreateInvite(request, env, now, groupId);
+      return methodNotAllowed('GET, POST');
+    }
+
+    const groupLeave = GROUP_LEAVE_PATH.exec(pathname);
+    if (groupLeave !== null) {
+      const groupId = groupLeave[1]!;
+      if (!isId(groupId)) return notFound();
+      if (request.method === 'POST') return handleRequestLeave(request, env, now, groupId);
+      if (request.method === 'DELETE') return handleCancelLeave(request, env, now, groupId);
+      return methodNotAllowed('POST, DELETE');
+    }
+
+    const invite = INVITE_PATH.exec(pathname);
+    if (invite !== null) {
+      const value = invite[1]!;
+      if (request.method === 'GET') return isInviteToken(value) ? handleGetInvite(request, env, now, value) : notFound();
+      if (request.method === 'DELETE') return isId(value) ? handleRevokeInvite(request, env, now, value) : notFound();
+      return methodNotAllowed('GET, DELETE');
+    }
+
+    const inviteJoin = INVITE_JOIN_PATH.exec(pathname);
+    if (inviteJoin !== null) {
+      const token = inviteJoin[1]!;
+      if (!isInviteToken(token)) return notFound();
+      if (request.method === 'POST') return handleJoin(request, env, now, token);
+      return methodNotAllowed('POST');
     }
 
     // 他の404と同じ形にする（アプリがエラーをJSONとして読めるように）。

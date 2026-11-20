@@ -13,6 +13,21 @@ import { allocateEqually, BASIS_POINTS_TOTAL } from './settlement.ts';
 /** アカウントを削除したメンバーの表示名（5章「アカウント削除」）。 */
 export const DELETED_USER_NAME = '削除されたユーザー';
 
+/**
+ * メンバーのアイコンの色のキー（`group_members.color`）。アプリの色の一覧と、このキーで揃える
+ * （docs/backend-design.md 9章。アプリとはコードを共有しない）。画面設計メモの「10色ほど」の、仮の一覧。
+ */
+export const MEMBER_COLORS = ['pink', 'red', 'orange', 'yellow', 'green', 'teal', 'blue', 'purple', 'brown', 'gray'] as const;
+
+/**
+ * 参加したメンバーの色を、他のメンバーと重ならないように選ぶ（画面設計メモ「グループの設定」）。`preferred`（復帰する
+ * 人の元の色）が使われていなければ、それを使う。全色が使われていれば、使われている数で一巡させる。
+ */
+export function pickMemberColor(usedColors: readonly string[], preferred: string | null = null): string {
+  if (preferred !== null && !usedColors.includes(preferred)) return preferred;
+  return MEMBER_COLORS.find((color) => !usedColors.includes(color)) ?? MEMBER_COLORS[usedColors.length % MEMBER_COLORS.length]!;
+}
+
 /** グループの全メンバー（脱退済み・削除済みを含む）。 */
 export async function loadMembers(db: D1Database, groupId: string): Promise<MemberInfo[]> {
   const { results } = await db

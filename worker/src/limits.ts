@@ -5,3 +5,6 @@ export const MAX_AMOUNT_MINOR = 1_000_000_000_000;
 
 /** 支出・固定費の内容の最大文字数（Unicodeのコードポイント数。SQLite の length() と同じ数え方）。 */
 export const MAX_DESCRIPTION_LENGTH = 100;
+
+/** メンバーの表示名の最大文字数（Unicodeのコードポイント数。DDLの `group_members.display_name` のCHECKと同じ）。 */
+export const MAX_DISPLAY_NAME_LENGTH = 20;
