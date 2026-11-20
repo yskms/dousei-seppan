@@ -24,6 +24,8 @@
 - D1の書き込みは、`expense_groups.data_version` と `write_token` の楽観ロックで行う。1つのグループへの書き込みは `worker/src/groupWrite.ts` の `writeToGroup` を通す（読み直して1回やり直す操作は `writeToGroupWithRetry`。検証用の読み込みは、渡す `plan` の中だけで行う）。後続の文の条件を `data_version = v+1` に「簡略化」しない。バージョンは、検証・計算に使うデータより**先に**読む。失敗理由の扱い、複数グループにまたがる書き込みの未決事項は、docs/backend-design.md 8章・12章。
 - 月の集計・精算額は `worker/src/monthState.ts` の `computeMonthFromState` だけが計算し、summary（締める前の見込み）と月締めの両方がこれを使う。別々に計算すると、締めた結果が見込みとずれる。月締めの書き込みは、D1のクエリ数が行数に比例して増えないよう `insertRowsGuarded` で複数行を1文にまとめている（Freeは1回の呼び出しにつき50クエリまで。文の数は費目×メンバーの数でゆるやかに増える。検査は `worker/test/closings.test.ts` の「D1のクエリ数」）。行ごとのINSERTに「簡略化」しない。
 - 脱退済み（`left`）への遷移は `worker/src/closedMonth.ts` の `markLeftStatement` だけが行い、月締め・精算（とCron）が使う。繰越済み（`carried`）の送金は、繰越先の月を締めるまで未処理と同じに扱う。「繰越は処理済み」と見て条件を外さない（繰り越した額は翌月の締めまでどの送金にも入っておらず、`left` にすると本人が精算できない。docs/backend-design.md 5章の4）。
+- 脱退の確定（`leaving` にし、翌月の割合のリセット・招待の取り消し・固定費の停止を行う）は `worker/src/membership.ts` の `confirmLeaveStatements` だけが行い、月締め・脱退を選ぶ操作・月初のCron（`worker/src/cron.ts`）が使う。経路ごとに書き写さない（確定の中身がずれる）。APIは、脱退月が終わったメンバーを、Cronの確定の前でも確定したものとして扱う（`access.ts` の `isLeaveEffective`）。最後の1人の脱退は、確定のときにグループごと消す（docs/backend-design.md 5章）。
+- 複数のグループにまたがる書き込み（アカウント削除。`worker/src/accountDeletion.ts`）は `writeToGroups` を通す。バージョンを上げる文は、全グループで1文のまま。グループごとのUPDATEに分けると、一部のグループだけ書き込まれる。`accountDeletion.ts` が渡している追加条件（読んだあとに別のグループへ参加されたことの検出）も外さない。`expense_groups` の行を消す文は、ほかの文の最後にまとめる（docs/backend-design.md 8章）。
 - グループ内のデータを扱うAPIは、認証・所属・月の閲覧範囲の判定を `worker/src/access.ts` で行う。他のグループのID、メンバーでない人、脱退済みの人は、区別せず404にする（IDの存在を教えない）。
 - グループの配下のテーブルには、必ず `group_id` が先頭の主キーか索引を持たせる。無いと、グループの削除や親の行の削除で、全グループの行を読む（D1は読んだ行数で課金。付録Aの冒頭）。
 - 繰越は、翌月の締めでメンバーごとの差額に合算して、送金を作り直す。翌月の支出の総額・負担額には入れない（docs/plan.md 6章）。
