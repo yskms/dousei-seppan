@@ -202,6 +202,10 @@ export function isLastMember(members: readonly MemberInfo[], due: readonly Membe
  * - 発行した未使用の招待を取り消す。
  * - 脱退者が支払者の固定費と、`category` 以外の固定費の自動登録を止める。
  * 脱退済み（`left`）への遷移は含まない。呼び出し側が、`markLeftStatement`（closedMonth.ts）を、これの後ろに足す。
+ *
+ * `closedThrough`: この書き込みのあとで、締め済みになっている最後の月（まだ締めていなければ null）。割合のリセットは、
+ * それより後の月だけ行う（締めた月の割合は確定している。月締めの中で呼ぶときは、いま締める月）。脱退月が、最初の締めで
+ * 飛ばされた月のときなどに、脱退月の翌月が、締め済み・締める月になることがある。
  */
 export function confirmLeaveStatements(
   db: D1Database,
@@ -211,10 +215,13 @@ export function confirmLeaveStatements(
   members: readonly MemberInfo[],
   due: readonly MemberInfo[],
   categoryIds: readonly string[],
+  closedThrough: string | null,
 ): D1PreparedStatement[] {
   if (due.length === 0) return [];
   const dueIds = due.map((member) => member.id);
-  const resetMonths = new Set(due.map((member) => nextMonth(member.leaveRequestedMonth!)));
+  const resetMonths = new Set(
+    due.map((member) => nextMonth(member.leaveRequestedMonth!)).filter((month) => closedThrough === null || month > closedThrough),
+  );
   return [
     db
       .prepare(

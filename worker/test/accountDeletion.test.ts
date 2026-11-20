@@ -11,6 +11,7 @@ import {
   createFixtureFactory,
   equalShares,
   insertCategoryRule,
+  insertClosing,
   insertExpenseRow,
   insertInviteRow,
   insertRecurringRow,
@@ -256,6 +257,17 @@ describe('アカウント削除のデータ処理', () => {
       assert.deepEqual([row!.status, row!.expense_end_month], ['deleted', '2026-10']);
       // リセットされるのは、その翌月（2026-11）。
       assert.deepEqual(await sharesOf(g.categoryId, '2026-11'), [[g.people.bob.memberId, 10000]]);
+    });
+
+    it('脱退を選んだ月が、最初の締めで飛ばされた月でも、締めた月の割合はリセットしない', async () => {
+      const g = await setup(['alice', 'bob'], { alice: { leaveRequestedMonth: '2026-10' } });
+      const ids = [g.people.alice.memberId, g.people.bob.memberId];
+      await insertCategoryRule(db, g.groupId, g.categoryId, '2026-11', equalShares(ids));
+      await insertClosing(db, g.groupId, '2026-11', g.people.bob.memberId);
+      assert.equal((await deleteAccount(db, g.people.alice.userId, NOW)).status, 'deleted');
+      // 最後の月は脱退月（2026-10）。リセットの対象は翌月（2026-11）だが、すでに締められているので、触れない。
+      assert.equal((await memberRow(g.people.alice.memberId))!.expense_end_month, '2026-10');
+      assert.equal((await sharesOf(g.categoryId, '2026-11')).length, 2);
     });
 
     it('脱退済み・削除済みのメンバーしか残らないグループは、自分が脱退済みでも消す（誰も見られないグループを残さない）', async () => {

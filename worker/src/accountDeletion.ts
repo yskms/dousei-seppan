@@ -13,6 +13,7 @@
 // 書き込みの前に、先にバージョンを読み、そのあとでデータを読む（groupWrite.ts 冒頭の注意1）。
 // 「どのグループのメンバーか」を、バージョンより前に読むので、読んだあとに新しいグループへ参加されると、そのグループが
 // 抜ける。それを検出するため、書き込みの条件に「いまのメンバー行が、読んだグループの中だけ」を足している。
+import { latestClosedMonth } from './access.ts';
 import { GROUP_WRITE_GUARD, writeToGroups } from './groupWrite.ts';
 import {
   DELETED_USER_NAME,
@@ -39,6 +40,8 @@ interface GroupPlan {
   memberId: string;
   members: Awaited<ReturnType<typeof loadMembers>>;
   categoryIds: string[];
+  /** 最後に締めた月。まだ締めていなければ null。 */
+  closedThrough: string | null;
   /** 残るメンバーがいないので、グループごと消す。 */
   deletesGroup: boolean;
 }
@@ -84,6 +87,7 @@ async function attempt(db: D1Database, userId: string, now: number): Promise<Del
       memberId: membership.member_id,
       members,
       categoryIds: await loadCategoryIds(db, membership.group_id),
+      closedThrough: await latestClosedMonth(db, membership.group_id),
       deletesGroup: members.every(
         (member) => member.id === membership.member_id || (member.status !== 'active' && member.status !== 'leaving'),
       ),
@@ -164,13 +168,17 @@ function anonymizeStatements(
   // 脱退が確定した・脱退済みの人は、確定のときに、割合のリセット・招待の取り消し・固定費の停止を済ませている。
   if (me.status === 'active') {
     const resetMonth = nextMonth(endMonth!);
+    // 締めた月の割合は確定している。脱退を選んだ月が、最初の締めで飛ばされた月のときなどは、リセットしない。
+    const resettable = plan.closedThrough === null || resetMonth > plan.closedThrough;
     const after = plan.members.map((member) =>
       member.id === plan.memberId
         ? { ...member, status: 'deleted' as const, displayName: DELETED_USER_NAME, expenseEndMonth: endMonth }
         : member,
     );
     statements.push(
-      ...resetSharesStatements(db, token, plan.groupId, resetMonth, plan.categoryIds, participantIds(after, resetMonth)),
+      ...(resettable
+        ? resetSharesStatements(db, token, plan.groupId, resetMonth, plan.categoryIds, participantIds(after, resetMonth))
+        : []),
       ...revokeInvitesStatement(db, token, plan.groupId, now, [plan.memberId]),
       ...pauseRecurringStatements(db, token, plan.groupId, now, { payerMemberIds: [plan.memberId], memberChanged: true }),
     );

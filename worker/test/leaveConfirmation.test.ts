@@ -247,6 +247,30 @@ describe('月締めでの脱退の確定', () => {
     assert.equal((await sharesOf(g.categoryId, '2026-11')).length, 0);
   });
 
+  it('脱退月が「飛ばした月」のとき（最初の締めが、それより後の月）も、締める月・締めた月の割合は、リセットしない', async () => {
+    // 作成月（2026-10）を脱退月に選んだ alice が、Cronの確定の前に、最初の支出がある月（2026-11）の締めを迎える。
+    // 確定の翌月（2026-11）は、いま締める月なので、リセットの対象にしない（締める月の割合は、引き継ぎで書く）。
+    const g = await setup(['alice', 'bob'], { alice: { leaveRequestedMonth: '2026-10' } });
+    await insertExpenseRow(db, {
+      groupId: g.groupId,
+      categoryId: g.categoryId,
+      payerMemberId: g.people.bob.memberId,
+      amountMinor: 6000,
+      targetMonth: '2026-11',
+    });
+    const closed = await api.close(g.people.bob, g.groupId, '2026-11');
+    assert.equal(closed.status, 201, JSON.stringify(closed.body));
+    assert.deepEqual(await memberRow(g.people.alice.memberId), {
+      status: 'leaving',
+      expense_end_month: '2026-10',
+      leave_requested_month: '2026-10',
+      left_at: null,
+    });
+    // 2026-11 の割合は、引き継ぎで書かれた2人の均等のまま（alice は脱退月 2026-10 を過ぎているが、締めた月は確定している）。
+    assert.equal((await sharesOf(g.categoryId, '2026-11')).length, 2);
+    assert.equal((await sharesOf(g.categoryId, '2026-12')).length, 0);
+  });
+
   it('2人が同時に脱退を確定しても、グループは消えない（お互いの精算が残る）。確定した翌月に参加する人はいないので、割合は書かない', async () => {
     const g = await setup(['alice', 'bob'], {
       alice: { leaveRequestedMonth: '2026-10' },

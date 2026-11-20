@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import worker from '../src/index.ts';
-import { MAX_GROUPS_PER_RUN, runScheduled } from '../src/cron.ts';
+import { DUE_LEAVES_SQL, MAX_GROUPS_PER_RUN, runScheduled } from '../src/cron.ts';
 import {
   createFixtureFactory,
   equalShares,
@@ -177,6 +177,13 @@ describe('定期処理: 月初の脱退の確定', () => {
       (await db.prepare('SELECT count(*) AS n FROM group_members WHERE group_id = ?').bind(g.groupId).first<{ n: number }>())!.n,
       0,
     );
+  });
+
+  it('脱退を選んだメンバーの検索は、部分索引を使う（毎時、全メンバーを読まない）', async () => {
+    const { results } = await db.prepare(`EXPLAIN QUERY PLAN ${DUE_LEAVES_SQL}`).all<{ detail: string }>();
+    const plan = results.map((row) => row.detail).join(' / ');
+    assert.match(plan, /idx_group_members_leave_requested/, plan);
+    assert.doesNotMatch(plan, /SCAN m/, plan);
   });
 
   it('入口の scheduled が、定期処理を呼ぶ', async () => {

@@ -7,7 +7,7 @@
 //   （access.ts の `isLeaveEffective`）。
 // - やり直さずに、競合したら409を返す（8章。確認ダイアログの内容が変わりうるため）。
 //   バージョンを先に読み、そのあとでデータを読む（groupWrite.ts 冒頭の注意1）。
-import { authenticateRequest, isLeaveEffective, isMonthClosed, loadGroupAccess } from './access.ts';
+import { authenticateRequest, isLeaveEffective, isMonthClosed, latestClosedMonth, loadGroupAccess } from './access.ts';
 import { markLeftStatement } from './closedMonth.ts';
 import { GROUP_WRITE_GUARD, readDataVersion, writeToGroup } from './groupWrite.ts';
 import { conflict, json, notFound, unauthorized } from './http.ts';
@@ -67,9 +67,10 @@ export async function handleRequestLeave(request: Request, env: Env, now: number
     return json({ leaveRequestedMonth: month, confirmed: true, groupDeleted: true });
   }
   const categoryIds = await loadCategoryIds(db, groupId);
+  const closedThrough = await latestClosedMonth(db, groupId);
   const written = await writeToGroup(db, groupId, version, (token) => [
     requested(token),
-    ...confirmLeaveStatements(db, token, groupId, now, members, due, categoryIds),
+    ...confirmLeaveStatements(db, token, groupId, now, members, due, categoryIds, closedThrough),
     // 関わる送金が無ければ、そのまま脱退済みになる。
     markLeftStatement(db, token, groupId, now, [access.member.id]),
   ]);

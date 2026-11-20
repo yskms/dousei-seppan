@@ -4,6 +4,8 @@
 // - summary は、締める前の月は現在の支出から計算した「見込み」、締めた月は締めた時点の結果を返す。
 //   見込みも締めも `computeMonthFromState`（同じ読み込み・同じ計算）を使うので、締めた結果は、直前の見込みと
 //   一致する（間に別の書き込みが入れば、バージョンが変わって締めは失敗する）。
+// - 月締めの中で、この月を脱退月に選んでいるメンバーの脱退も確定する（membership.ts。5章）。最後の1人なら、
+//   締めずにグループを削除して、200 `{ groupDeleted: true }` を返す。
 // - 月締めは、やり直さずに409を返す（4章・8章「競合したとき」。確認ダイアログの内容が変わりうるため）。
 //   バージョンを先に読み、そのあとで権限・状態・集計のデータを読む（groupWrite.ts 冒頭の注意1）。
 import { authenticateRequest, canViewMonth, loadGroupAccess } from './access.ts';
@@ -266,7 +268,8 @@ export async function handleCloseMonth(
       ]),
     ),
     // 脱退の確定（送金は、上で作ったあと）。確定したメンバーで、送金が0件の人は、続く文で脱退済みになる。
-    ...confirmLeaveStatements(db, token, groupId, now, members, due, categoryIds),
+    // 割合のリセットは、いま締める月より後の月だけ。
+    ...confirmLeaveStatements(db, token, groupId, now, members, due, categoryIds, month),
     // 脱退が確定していて、送金が0件のメンバーは、締めた時点で脱退済みにする（5章）。
     markLeftStatement(db, token, groupId, now, null),
   ]);

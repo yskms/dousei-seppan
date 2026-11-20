@@ -3,6 +3,7 @@
 //
 // いま入っているのは、月初の処理（脱退月が終わったのに締められていない脱退の確定。5章）。固定費の自動登録は、
 // 固定費のAPIと一緒に足す（7章）。
+import { latestClosedMonth } from './access.ts';
 import { markLeftStatement } from './closedMonth.ts';
 import { readDataVersion, writeToGroup } from './groupWrite.ts';
 import {
@@ -31,20 +32,28 @@ export interface CronSummary {
   failedGroups: string[];
 }
 
-/** 脱退を選んだ月が終わっている（グループの今月より前の）メンバーがいるグループ。古いものから。 */
+/**
+ * 脱退を選んだままのメンバーを引く検索。部分索引（idx_group_members_leave_requested）を使う。`GROUP BY` や
+ * `ORDER BY group_id` を足すと、プランナーが、索引でなく全メンバーの走査を選ぶ（test/cron.test.ts で、索引を使うことを確かめている）。
+ * グループごとのまとめと並べ替えは、JSで行う。
+ */
+export const DUE_LEAVES_SQL = `SELECT m.group_id AS group_id, g.timezone AS timezone, m.leave_requested_month AS month
+     FROM group_members m JOIN expense_groups g ON g.id = m.group_id
+    WHERE m.status = 'active' AND m.leave_requested_month IS NOT NULL`;
+
+/** 脱退を選んだ月が終わっている（グループの今月より前の）メンバーがいるグループ。古い月のものから。 */
 async function findGroupsWithDueLeaves(db: D1Database, now: number): Promise<string[]> {
-  // 部分索引（idx_group_members_leave_requested）で、脱退を選んだままのメンバーだけを読む。
-  const { results } = await db
-    .prepare(
-      `SELECT m.group_id AS group_id, g.timezone AS timezone, min(m.leave_requested_month) AS month
-         FROM group_members m JOIN expense_groups g ON g.id = m.group_id
-        WHERE m.status = 'active' AND m.leave_requested_month IS NOT NULL
-        GROUP BY m.group_id
-        ORDER BY month, m.group_id`,
-    )
-    .all<{ group_id: string; timezone: string; month: string }>();
+  const { results } = await db.prepare(DUE_LEAVES_SQL).all<{ group_id: string; timezone: string; month: string }>();
   // 今月かどうかは、グループのタイムゾーンで決める。SQLでは決められないので、ここで絞る。
-  return results.filter((row) => row.month < monthIn(row.timezone, now)).map((row) => row.group_id);
+  const oldest = new Map<string, string>();
+  for (const row of results) {
+    if (row.month >= monthIn(row.timezone, now)) continue;
+    const known = oldest.get(row.group_id);
+    if (known === undefined || row.month < known) oldest.set(row.group_id, row.month);
+  }
+  return [...oldest.entries()]
+    .sort(([idA, monthA], [idB, monthB]) => (monthA === monthB ? (idA < idB ? -1 : 1) : monthA < monthB ? -1 : 1))
+    .map(([groupId]) => groupId);
 }
 
 type GroupResult = 'confirmed' | 'deferred' | 'nothing';
@@ -66,12 +75,13 @@ async function confirmDueLeavesInGroup(db: D1Database, groupId: string, now: num
   // 最後の1人の脱退は、確定と同時に、グループのデータをすべて消す（5章「グループの削除」）。
   const lastMember = isLastMember(members, due);
   const categoryIds = lastMember ? [] : await loadCategoryIds(db, groupId);
+  const closedThrough = lastMember ? null : await latestClosedMonth(db, groupId);
 
   const written = await writeToGroup(db, groupId, version, (token) =>
     lastMember
       ? deleteGroupStatements(db, token, groupId)
       : [
-          ...confirmLeaveStatements(db, token, groupId, now, members, due, categoryIds),
+          ...confirmLeaveStatements(db, token, groupId, now, members, due, categoryIds, closedThrough),
           // 脱退月がすでに締められていれば、送金が済んでいるメンバーは、そのまま脱退済みになる。
           markLeftStatement(
             db,
