@@ -1,5 +1,6 @@
 // 入口。エンドポイントは docs/backend-design.md 9章の順に足す。
 import { handleCloseMonth, handleGetClosing, handleMonthSummary } from './closings.ts';
+import { runScheduled } from './cron.ts';
 import { isId } from './expenseInput.ts';
 import { handleCreateExpense, handleDeleteExpense, handleListExpenses, handleUpdateExpense } from './expenses.ts';
 import { methodNotAllowed, notFound } from './http.ts';
@@ -66,5 +67,10 @@ export default {
 
     // 他の404と同じ形にする（アプリがエラーをJSONとして読めるように）。
     return notFound();
+  },
+
+  // 1時間ごとの定期処理（wrangler.jsonc の triggers。docs/backend-design.md 7章）。
+  async scheduled(controller: ScheduledController, env: Env): Promise<void> {
+    await runScheduled(env, controller.scheduledTime);
   },
 } satisfies ExportedHandler<Env>;

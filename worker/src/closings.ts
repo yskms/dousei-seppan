@@ -10,6 +10,13 @@ import { authenticateRequest, canViewMonth, loadGroupAccess } from './access.ts'
 import { loadClosedMonth, markLeftStatement } from './closedMonth.ts';
 import { insertRowsGuarded, readDataVersion, writeToGroup } from './groupWrite.ts';
 import { conflict, forbidden, json, notFound, unauthorized } from './http.ts';
+import {
+  confirmLeaveStatements,
+  deleteGroupStatements,
+  dueLeaves,
+  isLastMember,
+  loadCategoryIds,
+} from './membership.ts';
 import { computeMonthFromState, evaluateClose, loadMonthState, type CloseBlock } from './monthState.ts';
 
 /** 締められない理由の応答。`forbidden` は403、それ以外は409（エラー名は理由と同じ）。 */
@@ -120,6 +127,17 @@ export async function handleCloseMonth(
   const state = await loadMonthState(db, groupId, month);
   const block = evaluateClose(state, access, month, now);
   if (block !== null) return closeBlockResponse(block);
+
+  // この月を脱退月に選んでいるメンバーの脱退は、月を締めたときに確定する（5章）。
+  const members = [...state.members.values()];
+  const due = dueLeaves(members, month);
+  if (isLastMember(members, due)) {
+    // 最後の1人が抜けるときは、締めずに、グループのデータをすべて消す（5章「グループの削除」）。
+    const deleted = await writeToGroup(db, groupId, version, (token) => deleteGroupStatements(db, token, groupId));
+    if (!deleted.ok) return conflict('conflict');
+    return json({ groupDeleted: true });
+  }
+  const categoryIds = due.length === 0 ? [] : await loadCategoryIds(db, groupId);
 
   const { result } = computeMonthFromState(state, month);
   const closingId = crypto.randomUUID();
@@ -247,6 +265,8 @@ export async function handleCloseMonth(
         transfer.amountMinor,
       ]),
     ),
+    // 脱退の確定（送金は、上で作ったあと）。確定したメンバーで、送金が0件の人は、続く文で脱退済みになる。
+    ...confirmLeaveStatements(db, token, groupId, now, members, due, categoryIds),
     // 脱退が確定していて、送金が0件のメンバーは、締めた時点で脱退済みにする（5章）。
     markLeftStatement(db, token, groupId, now, null),
   ]);

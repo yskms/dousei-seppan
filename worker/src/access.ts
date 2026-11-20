@@ -107,16 +107,27 @@ export function participatesInMonth(
 }
 
 /**
- * 支出を記録（登録・編集・削除）してよいか。脱退が確定したメンバー（`leaving`）は記録できない（5章）。
+ * 脱退が確定したものとして扱うメンバーか。`leaving` はもちろん、脱退を選んだ月（`leaveRequestedMonth`）が終わった
+ * `active` も含める。
  *
  * 脱退は「脱退月を締めたとき、または翌月1日」に確定するが、翌月1日の確定はCron（1時間ごと。競合すれば次の回）が
- * `status` を書く。確定を待たずに、脱退を選んだ月（`leaveRequestedMonth`）が終わったら、確定したものとして扱う
- * （待つと、Cronが動くまでの間、脱退予定のメンバーが翌月の支出を記録できてしまう）。
+ * `status` を書く。確定を待たずに、脱退を選んだ月が終わったら、確定したものとして扱う（待つと、Cronが動くまでの間、
+ * 脱退予定のメンバーが翌月の支出を記録したり、招待を発行したりできてしまう。5章）。
  */
-export function canWriteExpenses(access: GroupAccess, now: number): boolean {
-  if (access.member.status !== 'active') return false;
+export function isLeaveEffective(access: GroupAccess, now: number): boolean {
+  if (access.member.status !== 'active') return true;
   const leaveMonth = access.member.leaveRequestedMonth;
-  return leaveMonth === null || monthIn(access.group.timezone, now) <= leaveMonth;
+  return leaveMonth !== null && monthIn(access.group.timezone, now) > leaveMonth;
+}
+
+/** 支出を記録（登録・編集・削除）してよいか。脱退が確定したメンバーは記録できない（5章）。 */
+export function canWriteExpenses(access: GroupAccess, now: number): boolean {
+  return !isLeaveEffective(access, now);
+}
+
+/** 招待を発行してよいか。`leaving` 以降（脱退が確定したものとして扱うメンバーを含む）は発行できない（5章「招待の取り消し」）。 */
+export function canIssueInvites(access: GroupAccess, now: number): boolean {
+  return !isLeaveEffective(access, now);
 }
 
 /** 最後に締めた月。まだ締めていなければ null。 */

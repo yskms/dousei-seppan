@@ -12,6 +12,11 @@
   "workers_dev": false,
   "preview_urls": false,
 
+  // 定期処理（月初の脱退の確定など。docs/backend-design.md 7章）。1時間ごと。
+  "triggers": {
+    "crons": ["0 * * * *"]
+  },
+
   // ログに認証の値を出さないため、Workers Logs は無効のままにする（Singfolioと同じ）。
   "observability": {
     "enabled": false,

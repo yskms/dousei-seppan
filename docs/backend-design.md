@@ -840,6 +840,10 @@ CREATE TABLE group_members (
 
 CREATE INDEX idx_group_members_user ON group_members (user_id);
 
+-- 月初のCronが、「今月で脱退する」を選んだままのメンバーだけを引くための部分索引（7章）。
+CREATE INDEX idx_group_members_leave_requested ON group_members (leave_requested_month)
+  WHERE status = 'active' AND leave_requested_month IS NOT NULL;
+
 CREATE TABLE invites (
   id TEXT PRIMARY KEY NOT NULL,
   group_id TEXT NOT NULL REFERENCES expense_groups (id),

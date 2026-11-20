@@ -180,7 +180,16 @@ export function createFixtureFactory(db: D1Database) {
     };
   };
 
-  return Object.assign(createFixture, { createGroup, addCategory: insertCategory });
+  return Object.assign(createFixture, {
+    createGroup,
+    addCategory: insertCategory,
+    /** 既存のグループに、メンバーの行を足す（`userId` が null ならログインできない）。 */
+    addMember: insertMember,
+    /** 既存のグループに、ログインできるメンバーを足す。 */
+    addPerson: personIn,
+    /** グループを作らずにユーザー（とセッション）だけ作る。 */
+    addUser: async (name: string): Promise<Person> => ({ ...(await insertUser(name)), memberId: '' }),
+  });
 }
 
 /** 割合の合計が10000になる均等割り。端数は、IDの昇順の先頭から1ずつ（2章）。 */
@@ -273,4 +282,72 @@ export async function insertClosing(db: D1Database, groupId: string, month: stri
       .bind(`closing-${month}-${++seq}`, groupId, month, closedByMemberId, NOW),
     db.prepare('UPDATE expense_groups SET data_version = data_version + 1 WHERE id = ?').bind(groupId),
   ]);
+}
+
+/** 招待を直接書く（発行のAPIの検査は invites.test.ts。ほかの検査では、行だけ作る）。`token` は平文の招待トークン。 */
+export async function insertInviteRow(
+  db: D1Database,
+  invite: {
+    groupId: string;
+    invitedByMemberId: string;
+    token?: string;
+    expiresAt?: number;
+    revokedAt?: number | null;
+    consumed?: { memberId: string; at: number } | null;
+  },
+): Promise<{ id: string; token: string }> {
+  const id = `invite-${++seq}`;
+  const token = invite.token ?? randomBytes(32).toString('base64url');
+  await db
+    .prepare(
+      `INSERT INTO invites (id, group_id, invited_by_member_id, token_hash, expires_at, consumed_at,
+         consumed_by_member_id, revoked_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      id,
+      invite.groupId,
+      invite.invitedByMemberId,
+      createHash('sha256').update(token).digest('base64url'),
+      invite.expiresAt ?? NOW + 3 * 24 * 60 * 60 * 1000,
+      invite.consumed?.at ?? null,
+      invite.consumed?.memberId ?? null,
+      invite.revokedAt ?? null,
+      NOW,
+    )
+    .run();
+  return { id, token };
+}
+
+/** 固定費のテンプレートを直接書く（固定費のAPIは、まだ無い）。 */
+export async function insertRecurringRow(
+  db: D1Database,
+  recurring: {
+    groupId: string;
+    categoryId: string;
+    payerMemberId: string;
+    splitMethod?: 'category' | 'equal' | 'ratio' | 'fixed' | 'single';
+    pausedReason?: 'member_changed' | 'payer_left' | 'manual' | null;
+  },
+): Promise<string> {
+  const id = `recurring-${++seq}`;
+  await db
+    .prepare(
+      `INSERT INTO recurring_expenses (id, group_id, description, amount_minor, category_id, payer_member_id,
+         split_method, day_of_month, start_month, paused_at, paused_reason, created_at, updated_at)
+       VALUES (?, ?, '家賃', 80000, ?, ?, ?, 25, '2026-10', ?, ?, ?, ?)`,
+    )
+    .bind(
+      id,
+      recurring.groupId,
+      recurring.categoryId,
+      recurring.payerMemberId,
+      recurring.splitMethod ?? 'category',
+      recurring.pausedReason == null ? null : NOW,
+      recurring.pausedReason ?? null,
+      NOW,
+      NOW,
+    )
+    .run();
+  return id;
 }
