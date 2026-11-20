@@ -41,11 +41,13 @@ describe('統合テスト: 招待から脱退・精算まで', () => {
     const { alice, bob } = g.people;
     await insertCategoryRule(db, g.groupId, g.categoryId, '2026-10', equalShares([alice.memberId, bob.memberId]));
 
-    const register = async (who: Person, payer: Person, amountMinor: number, targetMonth: string, id: string, now = NOW) =>
+    // 登録の識別子（UUID）は、ラベルごとに1つ。同じラベルで登録すると、同じ登録の再送になる。
+    const registrationIds = new Map<string, string>();
+    const register = async (who: Person, payer: Person, amountMinor: number, targetMonth: string, label: string, now = NOW) =>
       read(
         await handleCreateExpense(
           request('POST', `/groups/${g.groupId}/expenses`, who.token, {
-            id,
+            id: registrationIds.get(label) ?? registrationIds.set(label, crypto.randomUUID()).get(label),
             expenseDate: '2026-11-19',
             targetMonth,
             amountMinor,

@@ -24,11 +24,12 @@ describe('支出の登録の入力', () => {
     assert.deepEqual(result.value, { ...valid, id: null, split: { method: 'category' } });
   });
 
-  it('id（アプリが作る、登録の識別子）は任意。IDの形だけを受け付ける', () => {
-    const result = create({ id: 'expense-1_A' });
+  it('id（アプリが作る、登録の識別子）は任意。UUID（小文字）だけを受け付ける', () => {
+    const uuid = '3f2b8c1e-9d4a-4e7b-8a61-5c0d2f7e9b14';
+    const result = create({ id: uuid });
     assert.ok(result.ok);
-    assert.equal(result.value.id, 'expense-1_A');
-    for (const id of ['', 'a b', 'あ', 'x'.repeat(65), 1, null, {}]) {
+    assert.equal(result.value.id, uuid);
+    for (const id of ['', 'a b', 'あ', '1', 'expense-1_A', 'x'.repeat(65), uuid.toUpperCase(), uuid.replaceAll('-', ''), `${uuid}0`, 1, null, {}]) {
       assert.equal(failedField(create({ id })), 'id', JSON.stringify(id));
     }
   });

@@ -235,17 +235,21 @@ export async function insertExpenseRow(
     payerMemberId: string;
     amountMinor: number;
     targetMonth: string;
+    /** 支出のID。無ければ `expense-<連番>`。登録の再送の検査は、UUIDのIDを指定する。 */
+    id?: string;
+    /** 登録した人。無ければ支払者。 */
+    createdByMemberId?: string;
     /** `category` 以外のとき、メンバーごとの負担額（合計は金額と一致させること）。 */
     split?: { method: 'equal' | 'ratio' | 'fixed' | 'single'; allocations: readonly (readonly [string, number])[] };
   },
 ): Promise<string> {
-  const id = `expense-${++seq}`;
+  const id = expense.id ?? `expense-${++seq}`;
   await db.batch([
     db
       .prepare(
         `INSERT INTO expenses (id, group_id, expense_date, target_month, description, amount_minor, category_id,
            payer_member_id, created_by_member_id, split_method, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?7, ?8, ?9, ?9)`,
+         VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?10, ?8, ?9, ?9)`,
       )
       .bind(
         id,
@@ -257,6 +261,7 @@ export async function insertExpenseRow(
         expense.payerMemberId,
         expense.split?.method ?? 'category',
         NOW,
+        expense.createdByMemberId ?? expense.payerMemberId,
       ),
     ...(expense.split?.allocations ?? []).map(([memberId, burdenMinor]) =>
       db

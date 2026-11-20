@@ -11,7 +11,7 @@ import {
   handleUpdateExpense,
 } from '../src/expenses.ts';
 import worker from '../src/index.ts';
-import { createFixtureFactory, insertClosing, NOW, type Fixture, type Person } from './apiFixture.ts';
+import { createFixtureFactory, insertClosing, insertExpenseRow, NOW, type Fixture, type Person } from './apiFixture.ts';
 import { openLocalDatabase, type LocalDatabase } from './localDatabase.ts';
 import { interferingEnv } from './monthApi.ts';
 
@@ -660,11 +660,10 @@ describe('支出のAPI', () => {
       });
     });
 
-    // 通信が途切れて、アプリが同じ登録を再送したときに、支出が2件できないこと（8章「支出の二重送信」）。
+    // 通信が途切れて、アプリが同じ登録を再送したときに、支出が2件できないこと（9章の支出API「二重送信」）。
     describe('二重送信（同じIDの再送）', () => {
-      let sequence = 0;
-      /** DBはテストの間で共有しているので、テストごとに別のIDを使う。 */
-      const newId = () => `retry-${++sequence}`;
+      /** 登録の `id` は、UUIDだけ。DBはテストの間で共有しているので、テストごとに別のIDを使う。 */
+      const newId = () => crypto.randomUUID();
 
       it('IDを指定して登録すると、そのIDの支出になる。同じ登録の再送は、新しく作らず、保存済みの支出を200で返す', async () => {
         const f = await createFixture();
@@ -683,9 +682,11 @@ describe('支出のAPI', () => {
         assert.equal(await dataVersion(f.groupId), version);
       });
 
-      it('IDの形が違えば400（field: id）。編集では、支出のIDを送れない', async () => {
+      it('IDはUUID（小文字）だけで、形が違えば400（field: id）。編集では、支出のIDを送れない', async () => {
         const f = await createFixture();
-        for (const id of ['', 'a b', 'あ', 'x'.repeat(65), 1, null]) {
+        // UUID（小文字）だけ。支出のIDは全グループで一意な主キーなので、短い値・連番・大文字は受け付けない。
+        const uuid = newId();
+        for (const id of ['', 'a b', 'あ', '1', 'retry-1', 'x'.repeat(65), uuid.toUpperCase(), uuid.replaceAll('-', ''), `${uuid}0`, 1, null]) {
           const result = await create(f, f.alice, body(f, { id }));
           assert.deepEqual([result.status, result.body], [400, { error: 'invalid_request', field: 'id' }], String(id));
         }
@@ -718,10 +719,27 @@ describe('支出のAPI', () => {
         assert.equal((await create(f, null, body(f, { id }))).status, 401);
         assert.deepEqual(await create(f, f.outsider, body(f, { id })), { status: 404, body: { error: 'not_found' } });
         assert.equal((await create(f, f.erin, body(f, { id }))).status, 404);
-        // 脱退が確定した人は、自分が登録した支出でも、再送を受け付けない（書き込みができないため）。
+        // 脱退が確定した人は、新しい登録ができない。
         const carolId = newId();
         assert.equal((await create(f, f.carol, body(f, { id: carolId, payerMemberId: f.bob.memberId }))).status, 403);
         assert.equal(await expenseRow(carolId), null);
+      });
+
+      it('脱退が確定した人が、確定の前に登録した支出の再送も、403（保存済みの支出を返さない）', async () => {
+        const f = await createFixture();
+        const id = newId();
+        await insertExpenseRow(db, {
+          id,
+          groupId: f.groupId,
+          categoryId: f.categoryId,
+          payerMemberId: f.carol.memberId,
+          amountMinor: 4280,
+          targetMonth: '2026-11',
+        });
+        const version = await dataVersion(f.groupId);
+        const result = await create(f, f.carol, body(f, { id, payerMemberId: f.carol.memberId }));
+        assert.deepEqual(result, { status: 403, body: { error: 'forbidden' } });
+        assert.equal(await dataVersion(f.groupId), version);
       });
 
       it('別のメンバーが登録した支出のID・別のグループの支出のIDは、409 conflict（中身を返さず、何も書かない）', async () => {
@@ -749,6 +767,28 @@ describe('支出のAPI', () => {
         assert.equal(await dataVersion(f.other.groupId), otherVersion);
         assert.equal((await expenseRow(id))!.group_id, f.groupId);
         assert.equal(await expenseCount(f.other.groupId), 0);
+      });
+
+      it('別のグループが、同じIDを同時に登録したときも、409 conflict（一意制約違反。何も書かない）', async () => {
+        const f = await createFixture();
+        const id = newId();
+        const version = await dataVersion(f.groupId);
+        // 検証のあと、書き込みの直前に、別のグループが同じIDで登録する（グループが違うので、バージョンの競合にならない）。
+        const racing = interferingEnv(env, async () => {
+          const other = await create(
+            f,
+            f.other.member,
+            body(f, { id, categoryId: f.other.categoryId, payerMemberId: f.other.member.memberId }),
+            { groupId: f.other.groupId },
+          );
+          assert.equal(other.status, 201);
+        });
+        const result = await create(f, f.alice, body(f, { id }), { env: racing });
+        assert.deepEqual(result, { status: 409, body: { error: 'conflict' } });
+        // バージョンの更新も含めて、batch 全体が取り消されている。
+        assert.equal(await dataVersion(f.groupId), version);
+        assert.equal(await expenseCount(f.groupId), 0);
+        assert.equal((await expenseRow(id))!.group_id, f.other.groupId);
       });
 
       it('同時に送られた同じ登録でも、1件だけできる。負けた側は、やり直した判定で、保存済みの支出を200で返す', async () => {
@@ -787,7 +827,7 @@ describe('支出のAPI', () => {
     });
   });
 
-  // === 編集 ===================================================================================
+  // === 編集 ====================================================================================
 
   describe('編集（PATCH /expenses/:id）', () => {
     it('送った項目だけを変える。金額・内容・日付・カテゴリ・支払者を変えられる', async () => {

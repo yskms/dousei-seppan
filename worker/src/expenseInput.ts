@@ -19,7 +19,8 @@ export type SplitInput =
 export interface CreateExpenseInput {
   /**
    * アプリが作る、この登録の識別子（冪等キー）。通信が途切れて同じ登録を再送したときに、支出が2件できないように
-   * する（docs/backend-design.md 8章「支出の二重送信」）。無ければ、Workerが決める（再送は防げない）。
+   * する（docs/backend-design.md 9章の支出API「二重送信」）。UUID（小文字）だけを受け付ける。支出のIDは全グループで
+   * 一意な主キーなので、短い値や連番を許すと、無関係なグループのIDがぶつかる。無ければ、Workerが決める（再送は防げない）。
    */
   id: string | null;
   expenseDate: string;
@@ -49,6 +50,13 @@ const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
 export function isId(value: unknown): value is string {
   return typeof value === 'string' && ID_PATTERN.test(value);
+}
+
+// 小文字のUUID（`crypto.randomUUID()` の形）。大文字を許すと、同じUUIDが別のIDとして保存される。
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+export function isUuid(value: unknown): value is string {
+  return typeof value === 'string' && UUID_PATTERN.test(value);
 }
 
 const fail = (field: string): { ok: false; field: string } => ({ ok: false, field });
@@ -161,7 +169,7 @@ const CREATE_EXPENSE_KEYS = ['id', ...EXPENSE_KEYS] as const;
 export function parseCreateExpense(body: Record<string, unknown>): ParseResult<CreateExpenseInput> {
   const extra = unknownKey(body, CREATE_EXPENSE_KEYS);
   if (extra !== null) return fail(extra);
-  if (body.id !== undefined && !isId(body.id)) return fail('id');
+  if (body.id !== undefined && !isUuid(body.id)) return fail('id');
   if (!isDate(body.expenseDate)) return fail('expenseDate');
   if (!isMonth(body.targetMonth)) return fail('targetMonth');
   const description = parseDescription(body.description === undefined ? null : body.description);
