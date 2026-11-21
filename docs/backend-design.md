@@ -512,7 +512,7 @@ Webからのアカウント削除依頼（Google Play向け）の本人確認は
 
 | API | 本文 | 成功 |
 |---|---|---|
-| `POST /auth/nonce` | `{ "kind": "native" }` | 200 `{ nonce, expiresAt }`。有効は5分。D1に書かない（認証の要らない入口が書くと、Freeの書き込みの上限を使い切られる） |
+| `POST /auth/nonce` | `{ "kind": "native" }`。`{ "kind": "web", "challenge": "<43字のbase64url>" }` も受け付ける（AndroidのAppleログイン用。それを足すまでは、その T を `/auth/login` に送っても必ず401） | 200 `{ nonce, expiresAt }`。有効は5分。D1に書かない（認証の要らない入口が書くと、Freeの書き込みの上限を使い切られる） |
 | `POST /auth/login` | `{ "provider": "apple" \| "google", "idToken", "nonce" }`（`nonce` は直前に受け取った値） | 200 `{ session }` |
 | `POST /auth/logout` | なし。`Authorization: Bearer <session>` | 204（本文なし） |
 
@@ -522,10 +522,13 @@ Webからのアカウント削除依頼（Google Play向け）の本人確認は
 - T は使い切り。IDトークンの検証まで通ったあとに使用済みにする（失敗した T は、同じ T で正しいトークンなら通る）。リプレイは401。
 - セッションの期限は、最後に使ってから90日（目安）。24時間に1回だけ「最後に使った時刻」を書く（毎回書くと、認証済みのリクエストの数だけ書き込みを使う）。ログインごとに別の値を発行するので、端末ごとに持てる。
 - ログアウトは、そのセッションだけを消す。何度呼んでも、知らない値でも204（`Authorization` が無い・形が違うときだけ401）。他の端末のセッションは残る。
+- アプリ側が守ること（サーバーが前提にしている。守らないと、すべて401になる。本物のトークンで確かめるときに、最初に見る）：
+  - Googleは、iOSでもAndroidでも、IDトークンの `aud` を**サーバー用（Web）のクライアントID**にする。iOSは、Google Sign-Inにサーバー用のクライアントIDを設定する（設定しないと `aud` がiOSのクライアントIDになる）。Singfolioの `plugins/withGoogleSignIn.js`（`GIDServerClientID`）が手本。
+  - IDトークンの `nonce` は必須で、T の SHA-256 の base64url と一致しなければならない。GoogleもAppleも、`nonce` を渡せるサインインのAPIを使い、渡した値がそのままトークンに入ることを確かめる。変換しない。Singfolioの `src/repositories/googleSignInRepository.ts`・`appleSignInRepository.ts` が手本。
 
 | 状態 | `error` | 意味 |
 |---|---|---|
-| 400 | `invalid_request` | 本文の形が不正（`provider`・`idToken`・`nonce` の欠落や型、`kind` の誤り、JSONでない） |
+| 400 | `invalid_request` | 本文の形が不正（`provider`・`idToken`・`nonce` の欠落や型、JSONでない。nonce：`kind` が `native`・`web` 以外、`native` に `challenge` が付いている、`web` で `challenge` が無い・形が違う） |
 | 401 | `unauthorized` | ログイン：T・IDトークンの検証に通らない。どの検査で落ちたかは教えない。ログアウト：`Authorization` が無い・形が違う |
 | 405 | `method_not_allowed` | POST 以外 |
 | 413 | `payload_too_large` | 本文が大きすぎる（nonce 1KB、login 10KB） |
@@ -1042,7 +1045,8 @@ Webからのアカウント削除依頼（Google Play向け）の本人確認は
   - Appleのサーバー間通知（`/auth/apple/notifications`）。`createSession` の `consent_revoked_at` の条件と、`identities` の列は、先に入れてある。
   - `POST /auth/delete`（再認証とAppleのrevoke）。データの処理は `deleteAccount` に実装済みで、再認証のあとにこれを呼ぶ。
   - 「ほかの端末をすべてログアウト」（Singfolioの `/auth/logout-others`、`revokeOtherSessions`）。画面が決まったら取り込む。
-- **公開前に埋める認証の値。** `wrangler.jsonc` の `GOOGLE_WEB_CLIENT_ID` は、Google Cloudでクライアントを作るまでの、実在しない値にしてある（Googleログインは、どのトークンも拒否される。`worker/test/config.test.ts` が、形を確かめる）。サーバー用（Web）のクライアントIDを作って置き換える（iOS・Androidのクライアントは、同じプロジェクトに作る。アプリが渡す値と同じにする）。本番のWorkerには `wrangler secret put NONCE_HMAC_KEY` で32バイト以上の乱数を入れる（ローカルは `worker/.dev.vars`。見本は `.dev.vars.example`）。
+- **ログインしただけのアカウントが残る（未使用のアカウントの扱い）。** 初めてのログインで `users` の行ができ、グループを作らず参加もしない人の行は、消えずに残る。`users.last_active_at` は、ログイン・ログアウト・セッションの更新で書いているが、読む処理が無い（Singfolioの `inactiveAccounts.ts`、最後に使ってから1年で消すCronに当たるものを、取り込んでいない）。`sub` しか持たないので、個人情報の面の実害は小さいが、行は増え続ける。決めること：（1）自動で消すか（消すなら、保持期間を、プライバシーポリシーとストアの申告に書く）。（2）Singfolioの `deleteInactiveUserStatement`（`users` の行を `DELETE` するだけ）を**そのまま取り込まない**。グループに入っている人の `users` を、匿名化せずに消すと、`group_members.user_id` が `NULL` になるだけで、名前が残る（5章の「匿名化は外部キーの `ON DELETE SET NULL` に任せない」に反する）。対象を「どのグループのメンバー行も持たない」アカウントに限るか、`deleteAccount` と同じ匿名化を通す。限る場合、グループに入った人は消えない。（3）消す文に条件を入れ直す（候補を選んだあとに使われたアカウントを消さない）、`last_active_at` が `NULL` の行を対象にしない、などのSingfolio側の注意は、取り込むときに引き継ぐ。
+- **公開前に埋める認証の値。** `wrangler.jsonc` の `GOOGLE_WEB_CLIENT_ID` は、Google Cloudでクライアントを作るまでの、実在しない値にしてある（Googleログインは、どのトークンも拒否される。`worker/test/config.test.ts` が、形を確かめる）。サーバー用（Web）のクライアントIDを作って置き換える（iOS・Androidのクライアントは、同じプロジェクトに作る。アプリが渡す値と同じにする）。仮の値のまま置き忘れると、Googleログインは、503ではなく401（トークンの不正と区別がつかない）になるので、`npm run deploy` の前に自動で走る確認（`worker/scripts/checkPlaceholders.ts`。`vars` に `not-created-yet` を含む値が残っていれば止める）を置いた。`wrangler deploy` を直接呼ぶと走らないので、デプロイは `npm run deploy` で行う。本番のWorkerには `wrangler secret put NONCE_HMAC_KEY` で32バイト以上の乱数を入れる（ローカルは `worker/.dev.vars`。見本は `.dev.vars.example`）。
 
 （以前の確認事項は、固定費の月末日を7章、匿名化の範囲を5章、対応通貨を2章、割合を直せる月の範囲を9章の「費目・負担割合API」で決めた）
 
@@ -1066,6 +1070,7 @@ Webからのアカウント削除依頼（Google Play向け）の本人確認は
    - 一意制約違反のエラーの形が、`isUniqueViolation`（`worker/src/groupWrite.ts`）の判定に合うこと。外れると、`'unique'` が例外（500）に変わる。
    - 複数グループの書き込み（`writeToGroups`。全グループを上げる1文のUPDATEと、`json_each` の束縛）が、本番D1でも通ること。
    - 月初のCronの部分索引（`idx_group_members_leave_requested`）が、本番D1でも効くこと（`EXPLAIN QUERY PLAN`）。
+   - 認証の値を置き換えたこと：`GOOGLE_WEB_CLIENT_ID`（仮の値のままでは `npm run deploy` が止まる）、本番の `NONCE_HMAC_KEY`（12章）。そのうえで、本物のApple / Googleのトークンで、`/auth/login` が通ること（`aud`・`nonce` の前提は、9章の「認証API」）。
    - 固定費の自動登録の1回の実行が、Freeの上限（1回の呼び出しにつき50）に収まること（上限50件の固定費・2人の均等割りで、ローカルD1では24。メンバーが多いと、収まる件数だけ作る。7章）と、毎時の検索（固定費の表の全走査。12章）の読み取り行数。
 
 **この文書は設計方針のまとめであり、SQLはまだ本番投入用の確定版ではない。** 次工程では、実際のマイグレーションを作りながらSQLite/D1で制約とトランザクションを検証する。

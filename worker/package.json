@@ -13,6 +13,7 @@
     "migrations:create": "wrangler d1 migrations create DB",
     "migrations:apply:local": "wrangler d1 migrations apply DB --local",
     "migrations:apply:remote": "wrangler d1 migrations apply DB --remote",
+    "predeploy": "node --disable-warning=ExperimentalWarning scripts/checkPlaceholders.ts",
     "deploy": "wrangler deploy"
   },
   "devDependencies": {

@@ -2,6 +2,9 @@
 // コメントの「§8」「7.3.x」は Singfolio の docs の章番号で、ここでは読めない。
 // コピーしていないもの: `revokeOtherSessions`（「ほかの端末をすべてログアウト」。このアプリでは、まだ画面もAPIも無い）。
 // `markUserActiveStatement` は、Singfolioでは account.ts にあるが、ここでは、使うのがこのファイルだけなので、ここに置く。
+// `users.last_active_at` は、ここ（と identity.ts）で書くだけで、読む処理が無い。Singfolioでは、未使用のアカウントの自動削除
+// （inactiveAccounts.ts）が読むが、このアプリには、まだ無い（docs/backend-design.md 12章）。`revokeSession` のコメントの
+// 「ログアウトの1か月後に、未使用1年として消える」は、その自動削除がある、Singfolioの前提。
 // Singfolio側を直したときは、差分を手で取り込む（docs/backend-design.md 1章）。
 //
 // セッションの値は、不透明なランダム値（32バイト = base64url の43字。JWTにしない）。D1の `sessions` には

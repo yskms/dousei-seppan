@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import { unstable_readConfig } from 'wrangler';
+import { PLACEHOLDER_MARKER, placeholderVars } from '../scripts/checkPlaceholders.ts';
 import { workerDir } from './localDatabase.ts';
 
 const config = unstable_readConfig({ config: path.join(workerDir, 'wrangler.jsonc') });
@@ -48,6 +49,20 @@ describe('wrangler.jsonc', () => {
         /^\d+-[a-z0-9]+\.apps\.googleusercontent\.com$/.test(String(vars.GOOGLE_WEB_CLIENT_ID)),
       'GOOGLE_WEB_CLIENT_ID が、クライアントIDの形でも、置き場所の値でもない',
     );
+  });
+
+  it('仮の値が vars に残ったままでは、デプロイできない（npm run deploy の前の確認）', () => {
+    const pkg = JSON.parse(readFileSync(path.join(workerDir, 'package.json'), 'utf8')) as {
+      scripts: Record<string, string>;
+    };
+    assert.match(pkg.scripts.predeploy ?? '', /scripts\/checkPlaceholders\.ts/);
+    // 仮の値は、確認が見つけられる印を含む。
+    assert.equal(GOOGLE_PLACEHOLDER.includes(PLACEHOLDER_MARKER), true);
+    assert.deepEqual(placeholderVars({ GOOGLE_WEB_CLIENT_ID: GOOGLE_PLACEHOLDER, APPLE_BUNDLE_ID: 'com.example.app' }), [
+      'GOOGLE_WEB_CLIENT_ID',
+    ]);
+    assert.deepEqual(placeholderVars({ GOOGLE_WEB_CLIENT_ID: '123-abc.apps.googleusercontent.com' }), []);
+    assert.deepEqual(placeholderVars({ N: 1, M: null }), []);
   });
 
   it('HTTPS検査を迂回する設定を vars に置かない', () => {
